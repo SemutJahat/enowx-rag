@@ -57,11 +57,7 @@ func (p *ChromaProvider) Index(ctx context.Context, projectID string, docs []Doc
 	name := p.collectionName(projectID)
 
 	// Determine embed_model and embed_dim for metadata injection.
-	embedModel := "unknown"
-	if mn, ok := p.embedder.(ModelNamer); ok {
-		embedModel = mn.ModelName()
-	}
-	embedDim := p.embedder.VectorSize()
+	embedModel, embedDim := p.EmbedIdentity()
 
 	texts := make([]string, len(docs))
 	ids := make([]string, len(docs))
@@ -72,10 +68,14 @@ func (p *ChromaProvider) Index(ctx context.Context, projectID string, docs []Doc
 		if ids[i] == "" {
 			ids[i] = strings.ReplaceAll(fmt.Sprintf("%x", d.Content), "/", "_") // fallback deterministic
 		}
-		metas[i] = map[string]any{"content": d.Content, "embed_model": embedModel, "embed_dim": embedDim}
+		metas[i] = map[string]any{"content": d.Content}
 		for k, v := range d.Meta {
 			metas[i][k] = v
 		}
+		// The embedder that made this vector, over whatever model a migrated
+		// or re-embedded document still names.
+		metas[i]["embed_model"] = embedModel
+		metas[i]["embed_dim"] = embedDim
 	}
 
 	vectors, err := p.embedder.Embed(ctx, texts)
@@ -253,6 +253,11 @@ func (p *ChromaProvider) ListPoints(ctx context.Context, projectID string, metaF
 }
 
 func (p *ChromaProvider) Close() error { return nil }
+
+// EmbedIdentity is the model and vector size Index stamps now (see EmbedIdentifier).
+func (p *ChromaProvider) EmbedIdentity() (string, int) {
+	return embedModelName(p.embedder), p.embedder.VectorSize()
+}
 
 // ExportPoints returns every point with full content and all string metadata.
 // Implements Exporter (for migration).

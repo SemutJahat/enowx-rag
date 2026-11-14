@@ -156,6 +156,7 @@ export interface MigrateRequest {
   chroma_url?: string
   pgvector_dsn?: string
   pgvector_table?: string
+  sqlite_path?: string
   voyage_api_key?: string
   voyage_model?: string
   voyage_dim?: number

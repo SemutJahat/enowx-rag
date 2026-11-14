@@ -140,11 +140,7 @@ func (p *PGVectorProvider) Index(ctx context.Context, projectID string, docs []D
 	}
 
 	// Determine embed_model and embed_dim for metadata injection.
-	embedModel := "unknown"
-	if mn, ok := p.embedder.(ModelNamer); ok {
-		embedModel = mn.ModelName()
-	}
-	embedDim := p.dim
+	embedModel, embedDim := p.EmbedIdentity()
 
 	batch := &pgx.Batch{}
 	for i, d := range docs {
@@ -152,13 +148,14 @@ func (p *PGVectorProvider) Index(ctx context.Context, projectID string, docs []D
 		if id == "" {
 			id = uuid.NewString()
 		}
-		meta := map[string]string{
-			"embed_model": embedModel,
-			"embed_dim":   fmt.Sprintf("%d", embedDim),
-		}
+		meta := make(map[string]string, len(d.Meta)+2)
 		for k, v := range d.Meta {
 			meta[k] = v
 		}
+		// The embedder that made this vector, over whatever model a migrated
+		// or re-embedded document still names.
+		meta["embed_model"] = embedModel
+		meta["embed_dim"] = fmt.Sprintf("%d", embedDim)
 		batch.Queue(fmt.Sprintf(`
 INSERT INTO %s (id, project_id, content, metadata, embedding)
 VALUES ($1, $2, $3, $4, $5::vector)
@@ -411,6 +408,11 @@ func (p *PGVectorProvider) ExportPoints(ctx context.Context, projectID string) (
 		docs = append(docs, Document{ID: docID, Content: content, Meta: meta})
 	}
 	return docs, rows.Err()
+}
+
+// EmbedIdentity is the model and vector size Index stamps now (see EmbedIdentifier).
+func (p *PGVectorProvider) EmbedIdentity() (string, int) {
+	return embedModelName(p.embedder), p.dim
 }
 
 func (p *PGVectorProvider) Close() error {

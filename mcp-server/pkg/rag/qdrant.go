@@ -95,11 +95,7 @@ func (p *QdrantProvider) Index(ctx context.Context, projectID string, docs []Doc
 	}
 
 	// Determine embed_model and embed_dim for metadata injection.
-	embedModel := "unknown"
-	if mn, ok := p.embedder.(ModelNamer); ok {
-		embedModel = mn.ModelName()
-	}
-	embedDim := p.vectorDim
+	embedModel, embedDim := p.EmbedIdentity()
 
 	points := make([]map[string]any, len(docs))
 	for i, d := range docs {
@@ -113,14 +109,16 @@ func (p *QdrantProvider) Index(ctx context.Context, projectID string, docs []Doc
 		}
 		id := pointID(rawID)
 		payload := map[string]any{
-			"content":     d.Content,
-			"doc_id":      rawID,
-			"embed_model": embedModel,
-			"embed_dim":   embedDim,
+			"content": d.Content,
+			"doc_id":  rawID,
 		}
 		for k, v := range d.Meta {
 			payload[k] = v
 		}
+		// The embedder that made this vector, over whatever model a migrated
+		// or re-embedded document still names.
+		payload["embed_model"] = embedModel
+		payload["embed_dim"] = embedDim
 		// Convert []float32 to []float64 for JSON
 		vec := make([]float64, len(vectors[i]))
 		for j, x := range vectors[i] {
@@ -363,6 +361,11 @@ func pointID(raw string) string {
 }
 
 func (p *QdrantProvider) Close() error { return nil }
+
+// EmbedIdentity is the model and vector size Index stamps now (see EmbedIdentifier).
+func (p *QdrantProvider) EmbedIdentity() (string, int) {
+	return embedModelName(p.embedder), p.vectorDim
+}
 
 // TokensUsed forwards the embedder's cumulative token count when the embedder
 // tracks it (e.g. Voyage), so core.Service can report embed tokens without

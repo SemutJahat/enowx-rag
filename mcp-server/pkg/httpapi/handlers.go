@@ -180,13 +180,14 @@ func (h *Handlers) ReindexProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":         "synced",
-		"project_id":     projectID,
-		"chunks_indexed": result.Indexed,
-		"points_deleted": result.Deleted,
-		"files_scanned":  result.FilesScanned,
-		"skipped":        result.Skipped,
-		"stale_error":    result.StaleError,
+		"status":            "synced",
+		"project_id":        projectID,
+		"chunks_indexed":    result.Indexed,
+		"points_deleted":    result.Deleted,
+		"files_scanned":     result.FilesScanned,
+		"skipped":           result.Skipped,
+		"points_reembedded": result.Reembedded,
+		"stale_error":       result.StaleError,
 	})
 }
 

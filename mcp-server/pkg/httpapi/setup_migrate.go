@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/enowdev/enowx-rag/mcp-server/pkg/config"
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/core"
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/migrate"
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/migrate/cloud"
@@ -38,6 +42,10 @@ type migrateRequest struct {
 	ChromaURL     string `json:"chroma_url"`
 	PGVectorDSN   string `json:"pgvector_dsn"`
 	PGVectorTable string `json:"pgvector_table"`
+	// SQLitePath is the destination file for vector_store "sqlite"; empty
+	// means the running store's file (sqlite_path in the config, else
+	// ~/.enowx-rag/rag.db). A leading "~/" is the home folder.
+	SQLitePath    string `json:"sqlite_path"`
 	VoyageAPIKey  string `json:"voyage_api_key"`
 	VoyageModel   string `json:"voyage_model"`
 	VoyageDim     int    `json:"voyage_dim"`
@@ -61,7 +69,11 @@ func (h *Handlers) Migrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "source_project and dest_project are required")
 		return
 	}
-	if req.CloudSource == nil && req.SourceProject == req.DestProject && sameStore(req) {
+	running := runningConfig()
+	if strings.EqualFold(req.VectorStore, "sqlite") {
+		req.SQLitePath = sqliteDestPath(req.SQLitePath, running)
+	}
+	if req.CloudSource == nil && req.SourceProject == req.DestProject && sameStore(req, running) {
 		writeErr(w, http.StatusBadRequest, "destination must differ from source (project name or store)")
 		return
 	}
@@ -76,6 +88,7 @@ func (h *Handlers) Migrate(w http.ResponseWriter, r *http.Request) {
 		ChromaURL:     req.ChromaURL,
 		PGVectorDSN:   req.PGVectorDSN,
 		PGVectorTable: req.PGVectorTable,
+		SQLitePath:    req.SQLitePath,
 		VoyageAPIKey:  req.VoyageAPIKey,
 		VoyageModel:   req.VoyageModel,
 		VoyageDim:     req.VoyageDim,
@@ -102,6 +115,7 @@ func (h *Handlers) Migrate(w http.ResponseWriter, r *http.Request) {
 			TextField: req.CloudSource.TextField,
 		})
 		if cerr != nil {
+			_ = dst.Close()
 			writeErr(w, http.StatusBadRequest, "cloud source: "+cerr.Error())
 			return
 		}
@@ -109,6 +123,7 @@ func (h *Handlers) Migrate(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p, ok := h.svc.Provider().(rag.Exporter)
 		if !ok {
+			_ = dst.Close()
 			writeErr(w, http.StatusBadRequest, "the current vector store does not support export")
 			return
 		}
@@ -170,10 +185,47 @@ func (h *Handlers) Migrate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// sameStore reports whether the request's destination store config matches the
-// running provider closely enough that a same-name migration would be a no-op
-// target. We keep this conservative: only block when store type is empty
-// (interpreted as "same store") — a different store or project is always allowed.
-func sameStore(req migrateRequest) bool {
-	return req.VectorStore == ""
+// sameStore reports whether the request's destination store is the running
+// one, where a same-name migration would write a project into itself: an
+// empty store type (read as "same store"), or the running SQLite file. A
+// different store or project is always allowed.
+func sameStore(req migrateRequest, running *config.Config) bool {
+	switch strings.ToLower(req.VectorStore) {
+	case "":
+		return true
+	case "sqlite":
+		return strings.EqualFold(running.VectorStore, "sqlite") && samePath(req.SQLitePath, running.StorePath())
+	}
+	return false
+}
+
+// runningConfig is the configuration the server runs with (env over the
+// config file over defaults).
+func runningConfig() *config.Config {
+	cfg, err := config.Resolve()
+	if err != nil {
+		return config.Default()
+	}
+	return cfg
+}
+
+// sqliteDestPath is the destination SQLite file: path with a leading "~/"
+// expanded, or the running store's file when path is empty.
+func sqliteDestPath(path string, running *config.Config) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return running.StorePath()
+	}
+	if rest, ok := strings.CutPrefix(path, "~/"); ok {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, rest)
+		}
+	}
+	return path
+}
+
+func samePath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	return errA == nil && errB == nil && absA == absB
 }

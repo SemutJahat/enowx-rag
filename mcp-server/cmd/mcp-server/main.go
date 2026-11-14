@@ -429,7 +429,10 @@ func registerMCPTools(server *mcp.Server, svc *core.Service) {
 			"chunks_updated": result.Updated,
 			"points_deleted": result.Deleted,
 			"files_scanned":  result.FilesScanned,
-			"stale_error":    result.StaleError,
+			// Points embedded again because another embedding model or
+			// vector size wrote them (the model in the config changed).
+			"points_reembedded": result.Reembedded,
+			"stale_error":       result.StaleError,
 		}, nil
 	})
 

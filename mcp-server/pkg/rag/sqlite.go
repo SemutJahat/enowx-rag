@@ -21,13 +21,22 @@ import (
 // vectors as blobs searched by brute force (cosine) and the text in an FTS5
 // table for hybrid search: a store that runs inside the program, nothing
 // to install or keep running. It suits a project of up to a few hundred
-// thousand chunks; a project's vectors are held in memory once searched.
+// thousand chunks; a project's vectors are held in memory once searched, and
+// read again after anyone, this process or another sharing the file, writes.
 type SQLiteProvider struct {
 	db       *sql.DB
 	embedder EmbeddingClient
 
+	// watch is a connection held open only to read PRAGMA data_version,
+	// which changes whenever another connection commits: another process
+	// sharing the file (each Claude session runs its own server) or this
+	// process's own writes, made on the db pool's other connection.
+	wmu   sync.Mutex
+	watch *sql.Conn
+
 	mu    sync.Mutex
 	cache map[string][]cached // project → its points' vectors, normalized
+	seen  int64               // data_version the cached vectors were read at
 }
 
 type cached struct {
@@ -44,7 +53,9 @@ func NewSQLiteProvider(path string, embedder EmbeddingClient) (*SQLiteProvider, 
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
 	}
-	db.SetMaxOpenConns(1) // one writer; reads are fast enough in line
+	// One connection reads and writes (reads are fast enough in line); the
+	// other is the watch connection (see SQLiteProvider.watch).
+	db.SetMaxOpenConns(2)
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS points (project TEXT NOT NULL, id TEXT NOT NULL, content TEXT NOT NULL, meta TEXT NOT NULL, vector BLOB NOT NULL, PRIMARY KEY (project, id))`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS points_fts USING fts5(content, project UNINDEXED, id UNINDEXED, tokenize = 'unicode61')`,
@@ -55,7 +66,30 @@ func NewSQLiteProvider(path string, embedder EmbeddingClient) (*SQLiteProvider, 
 			return nil, fmt.Errorf("sqlite: schema: %w", err)
 		}
 	}
-	return &SQLiteProvider{db: db, embedder: embedder, cache: map[string][]cached{}}, nil
+	watch, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: open: %w", err)
+	}
+	return &SQLiteProvider{db: db, embedder: embedder, watch: watch, cache: map[string][]cached{}, seen: -1}, nil
+}
+
+// dataVersion is SQLite's data_version on the watch connection. If that
+// connection broke, a new one is held for next time and the error returned:
+// the caller then reads the vectors again, as its counter starts elsewhere.
+func (p *SQLiteProvider) dataVersion(ctx context.Context) (int64, error) {
+	p.wmu.Lock()
+	defer p.wmu.Unlock()
+	var v int64
+	err := p.watch.QueryRowContext(ctx, `PRAGMA data_version`).Scan(&v)
+	if err == nil {
+		return v, nil
+	}
+	p.watch.Close() // frees its slot in the pool for the new one
+	if conn, cerr := p.db.Conn(ctx); cerr == nil {
+		p.watch = conn
+	}
+	return 0, err
 }
 
 func (p *SQLiteProvider) CreateCollection(ctx context.Context, projectID string) error {
@@ -76,6 +110,11 @@ func (p *SQLiteProvider) DeleteCollection(ctx context.Context, projectID string)
 	}
 	p.forget(projectID)
 	return tx.Commit()
+}
+
+// EmbedIdentity is the model and vector size Index stamps now (see EmbedIdentifier).
+func (p *SQLiteProvider) EmbedIdentity() (string, int) {
+	return embedModelName(p.embedder), p.embedder.VectorSize()
 }
 
 func (p *SQLiteProvider) forget(projectID string) {
@@ -99,10 +138,7 @@ func (p *SQLiteProvider) Index(ctx context.Context, projectID string, docs []Doc
 	if len(vectors) != len(docs) {
 		return fmt.Errorf("embedding count mismatch")
 	}
-	model := "unknown"
-	if mn, ok := p.embedder.(ModelNamer); ok {
-		model = mn.ModelName()
-	}
+	model := embedModelName(p.embedder)
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -116,10 +152,14 @@ func (p *SQLiteProvider) Index(ctx context.Context, projectID string, docs []Doc
 		if id == "" {
 			id = uuid.NewString()
 		}
-		meta := map[string]string{"embed_model": model, "embed_dim": fmt.Sprint(len(vectors[i])), "doc_id": id}
+		meta := map[string]string{"doc_id": id}
 		for k, v := range d.Meta {
 			meta[k] = v
 		}
+		// The embedder that made this vector, over whatever model a migrated
+		// or re-embedded document still names.
+		meta["embed_model"] = model
+		meta["embed_dim"] = fmt.Sprint(len(vectors[i]))
 		raw, _ := json.Marshal(meta)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO points(project, id, content, meta, vector) VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(project, id) DO UPDATE SET content = excluded.content, meta = excluded.meta, vector = excluded.vector`,
@@ -177,14 +217,22 @@ func (p *SQLiteProvider) UpdatePayload(ctx context.Context, projectID string, do
 			return err
 		}
 	}
-	// Vectors are untouched, so the cached vectors stay valid.
+	// Vectors are untouched (the commit still moves data_version, so the
+	// next search reads them again).
 	return tx.Commit()
 }
 
-// vectors are project's points' vectors, normalized, read once.
+// vectors are project's points' vectors, normalized: read once, and again
+// after a commit by anyone sharing the file (its data_version moved), so a
+// search sees what another process wrote or deleted.
 func (p *SQLiteProvider) vectors(ctx context.Context, projectID string) ([]cached, error) {
+	v, verr := p.dataVersion(ctx)
 	p.mu.Lock()
-	if c, ok := p.cache[projectID]; ok {
+	if verr != nil || v != p.seen {
+		p.cache = map[string][]cached{}
+		p.seen = v
+	}
+	if c, ok := p.cache[projectID]; ok && verr == nil {
 		p.mu.Unlock()
 		return c, nil
 	}
@@ -206,8 +254,11 @@ func (p *SQLiteProvider) vectors(ctx context.Context, projectID string) ([]cache
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// Kept only if no newer commit was seen meanwhile (by another search).
 	p.mu.Lock()
-	p.cache[projectID] = out
+	if verr == nil && p.seen == v {
+		p.cache[projectID] = out
+	}
 	p.mu.Unlock()
 	return out, nil
 }
@@ -251,18 +302,24 @@ func (p *SQLiteProvider) dense(ctx context.Context, projectID string, q []float3
 	return scored, nil
 }
 
-// fill reads rs' content and metadata.
+// fill reads rs' content and metadata. A point deleted since it was ranked
+// (by another process sharing the file) is left out.
 func (p *SQLiteProvider) fill(ctx context.Context, projectID string, rs []Result) ([]Result, error) {
-	for i := range rs {
+	out := rs[:0]
+	for _, r := range rs {
 		var content, raw string
-		err := p.db.QueryRowContext(ctx, `SELECT content, meta FROM points WHERE project = ? AND id = ?`, projectID, rs[i].ID).Scan(&content, &raw)
+		err := p.db.QueryRowContext(ctx, `SELECT content, meta FROM points WHERE project = ? AND id = ?`, projectID, r.ID).Scan(&content, &raw)
+		if err == sql.ErrNoRows {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
-		rs[i].Content = content
-		_ = json.Unmarshal([]byte(raw), &rs[i].Meta)
+		r.Content = content
+		_ = json.Unmarshal([]byte(raw), &r.Meta)
+		out = append(out, r)
 	}
-	return rs, nil
+	return out, nil
 }
 
 func (p *SQLiteProvider) SemanticSearch(ctx context.Context, projectID, query string, limit int) ([]Result, error) {
@@ -476,7 +533,12 @@ func (p *SQLiteProvider) TokensUsed() int64 {
 	return 0
 }
 
-func (p *SQLiteProvider) Close() error { return p.db.Close() }
+func (p *SQLiteProvider) Close() error {
+	p.wmu.Lock()
+	p.watch.Close()
+	p.wmu.Unlock()
+	return p.db.Close()
+}
 
 func encodeVector(v []float32) []byte {
 	b := make([]byte, 4*len(v))

@@ -36,8 +36,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starts `File: path:start-end (symbol)` (`chunk_version` v3, so existing
   indexes re-embed once).
 - `Indexer.Files` lets a program embedding enowx-rag pass the files to index.
+- **Migration into the built-in SQLite store**: the Migration page and
+  `POST /api/migrate` take `vector_store: sqlite` with an optional
+  `sqlite_path` (empty: the running store's file, `~/` expanded). Migrating a
+  project into itself in the running file is refused.
+- `rag.EmbedIdentifier` (all built-in stores): the embedding model and vector
+  size a store stamps on the points it writes now.
 
 ### Fixed
+- **Changing the embedding model left the old vectors in place**: a re-index
+  skipped unchanged chunks whatever model embedded them, so after a model
+  change searches compared the query with another model's vectors (wrong
+  results, no error) or, at another size, skipped them (nothing found), and
+  memory notes were never re-embedded at all. The first search or sync of a
+  project now re-embeds, from their stored text, the points another model or
+  size wrote, chunks and notes alike, once per process
+  (`points_reembedded` in the `rag_index_project` result). The size an
+  embedder reports is checked on a real vector first, so a wrong guess (TEI
+  without `/info`) doesn't re-embed a project. A store with a fixed size
+  (Qdrant collection, pgvector table) reports an error pointing to Migration.
+- **SQLite: searches missed what other sessions wrote**: each process (every
+  Claude session runs its own server over the shared `rag.db`) read a
+  project's vectors once and dropped them only after its own writes. Points
+  another process indexed were never found by vector search there, and once
+  another process deleted a point, every search there failed with
+  `sql: no rows in result set` until a restart. The store now watches
+  SQLite's `data_version` on a connection it holds open and reads the
+  vectors again after anyone commits; a point deleted mid-search is left out
+  instead of failing the search.
+- **Migrated points kept the old model's label**: every store let a
+  document's metadata override the `embed_model`/`embed_dim` it stamps, so a
+  migration wrote the source model's name on the destination's vectors.
+  Stores now always stamp the embedder they used.
 - **Stale chunks after editing a file**: a sync deleted chunks only when
   their file was gone, so code removed from a file that still exists stayed
   in the index and was served as current. A sync now deletes every chunk of

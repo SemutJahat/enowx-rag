@@ -9,7 +9,7 @@ interface MigrationProps {
   projects: ProjectInfo[]
 }
 
-type Store = 'qdrant' | 'pgvector' | 'chroma'
+type Store = 'sqlite' | 'qdrant' | 'pgvector' | 'chroma'
 type Embedder = 'voyage' | 'openai' | 'tei'
 
 export function Migration({ activeProject, projects }: MigrationProps) {
@@ -37,6 +37,7 @@ export function Migration({ activeProject, projects }: MigrationProps) {
   const [chromaURL, setChromaURL] = useState('http://localhost:8000')
   const [pgDSN, setPgDSN] = useState('postgresql://enowdev@localhost:5432/enowxrag')
   const [pgTable, setPgTable] = useState('project_memory')
+  const [sqlitePath, setSqlitePath] = useState('')
   const [voyageKey, setVoyageKey] = useState('')
   const [voyageModel, setVoyageModel] = useState('voyage-4')
   const [voyageDim, setVoyageDim] = useState(1024)
@@ -104,6 +105,7 @@ export function Migration({ activeProject, projects }: MigrationProps) {
       chroma_url: store === 'chroma' ? chromaURL : undefined,
       pgvector_dsn: store === 'pgvector' ? pgDSN : undefined,
       pgvector_table: store === 'pgvector' ? pgTable : undefined,
+      sqlite_path: store === 'sqlite' && sqlitePath.trim() ? sqlitePath.trim() : undefined,
       voyage_api_key: embedder === 'voyage' ? voyageKey : undefined,
       voyage_model: embedder === 'voyage' ? voyageModel : undefined,
       voyage_dim: embedder === 'voyage' ? voyageDim : undefined,
@@ -214,6 +216,7 @@ export function Migration({ activeProject, projects }: MigrationProps) {
               <div className="field">
                 <label>Destination vector store</label>
                 <select className="select-box mono" value={store} onChange={(e) => setStore(e.target.value as Store)}>
+                  <option value="sqlite">sqlite (built-in)</option>
                   <option value="qdrant">qdrant</option>
                   <option value="pgvector">pgvector</option>
                   <option value="chroma">chroma</option>
@@ -230,6 +233,12 @@ export function Migration({ activeProject, projects }: MigrationProps) {
             </div>
 
             {/* Store fields */}
+            {store === 'sqlite' && (
+              <div className="field"><label>SQLite file (empty for the running store)</label>
+                <input className="input mono" value={sqlitePath} onChange={(e) => setSqlitePath(e.target.value)} placeholder="~/.enowx-rag/rag.db" />
+                <div className="field-hint">Leave empty to write into the store this server runs on, under the destination project name. A model change on the running store needs no migration: the next search or sync re-embeds it in place.</div>
+              </div>
+            )}
             {store === 'qdrant' && (
               <>
                 <div className="field"><label>Qdrant URL</label>

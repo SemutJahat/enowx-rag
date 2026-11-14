@@ -110,6 +110,7 @@ type Service struct {
 	metricsStore MetricsStore // optional durable metrics; nil = in-memory only
 	backend      string       // vector store name (e.g. "qdrant"), set by main.go
 	syncer       *autoSync    // optional: keeps indexed directories in sync (EnableAutoSync)
+	embedChecks  embedChecks  // projects found current for the embedder (refreshEmbeddings)
 }
 
 // MetricsStore is an optional durable sink for query metrics, injected into
@@ -266,6 +267,15 @@ func (s *Service) retrieveCandidates(ctx context.Context, projectID, query strin
 //
 // Defaults: K=5, Recall=40.
 func (s *Service) Search(ctx context.Context, projectID, query string, opts SearchOpts) ([]rag.Result, error) {
+	// Points another embedding model wrote (the model in the config changed)
+	// can't be compared with this query's vector: re-embed them first, once.
+	// A failure never fails the search; it is logged and retried later.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reembedTimeout)
+	if _, err := s.refreshEmbeddings(rctx, projectID); err != nil {
+		fmt.Fprintf(os.Stderr, "re-embed %s: %v\n", projectID, err)
+	}
+	cancel()
+
 	// Bring the project's indexed directories up to date first, when enabled
 	// and due, so results reflect the files as they are now.
 	s.autoSyncProject(ctx, projectID)
@@ -449,6 +459,18 @@ func (s *Service) IndexProject(ctx context.Context, projectID, dir string) (*ind
 		return nil, err
 	}
 
+	// Re-embed what another embedding model wrote first: the indexer skips
+	// unchanged chunks, so it would leave their old vectors in place.
+	reembedded, err := s.refreshEmbeddings(ctx, projectID)
+	if err != nil {
+		s.events.Publish(Event{
+			Type:      "index_failed",
+			Timestamp: time.Now(),
+			Data:      map[string]any{"project_id": projectID, "error": err.Error()},
+		})
+		return nil, err
+	}
+
 	idx := s.indexer
 	if idx == nil {
 		idx = indexer.NewIndexer(s.provider, 1500)
@@ -463,6 +485,7 @@ func (s *Service) IndexProject(ctx context.Context, projectID, dir string) (*ind
 		})
 		return nil, err
 	}
+	result.Reembedded = reembedded
 
 	s.recordIndexed(projectID, dir)
 
@@ -476,6 +499,7 @@ func (s *Service) IndexProject(ctx context.Context, projectID, dir string) (*ind
 			"deleted":       result.Deleted,
 			"files_scanned": result.FilesScanned,
 			"skipped":       result.Skipped,
+			"reembedded":    result.Reembedded,
 		},
 	})
 

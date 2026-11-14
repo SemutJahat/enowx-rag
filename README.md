@@ -776,7 +776,9 @@ stores alongside every chunk) rather than copying raw vectors. Use it to:
   destination collection is re-embedded from the source text.
   (For pgvector, a new dimension requires a **new table name** — all projects in
   one pgvector table share a fixed vector dimension.)
-- **Move between vector stores** — e.g. Qdrant → pgvector.
+- **Move between vector stores** — e.g. Qdrant → pgvector, or into the built-in
+  SQLite store (`sqlite_path` optional; empty means the running store's file,
+  where the destination project needs a new name).
 - **Import from an external cloud vector DB** — **Qdrant Cloud** is verified;
   **Pinecone**, **Weaviate**, and **Chroma Cloud** connectors are *experimental*
   (built from vendor docs, mock-tested only — not verified against a live
@@ -785,6 +787,15 @@ stores alongside every chunk) rather than copying raw vectors. Use it to:
 Migrations run asynchronously with live progress over SSE. The source project is
 never removed automatically; after a successful migration the UI offers an
 explicit "Delete source" action.
+
+**Changing the model of the store you run on needs no migration.** Edit the
+model or dimension in `~/.enowx-rag/config.yaml` and restart every session that
+runs enowx-rag. The first search or sync of each project then re-embeds, from
+their stored text, the points another model or size wrote — code chunks and
+memory notes alike — once (`points_reembedded` in the `rag_index_project`
+result). The built-in SQLite store takes the new vectors in place; a Qdrant
+collection or pgvector table has a fixed vector size, so a new *dimension*
+there still needs a migration to a new collection or table.
 
 ## Embedding options
 

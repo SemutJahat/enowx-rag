@@ -79,6 +79,31 @@ type ModelNamer interface {
 	ModelName() string
 }
 
+// EmbedIdentifier is implemented by providers that can say which embedding
+// model and vector size they stamp (embed_model / embed_dim) on the points
+// they write now. core.Service compares it with what stored points carry to
+// find the points another model or size embedded, and re-embeds them from
+// their stored text (after the model in the config changed).
+type EmbedIdentifier interface {
+	EmbedIdentity() (model string, dim int)
+}
+
+var (
+	_ EmbedIdentifier = (*SQLiteProvider)(nil)
+	_ EmbedIdentifier = (*QdrantProvider)(nil)
+	_ EmbedIdentifier = (*PGVectorProvider)(nil)
+	_ EmbedIdentifier = (*ChromaProvider)(nil)
+)
+
+// embedModelName is the embed_model a provider stamps for embedder e: its
+// model name, or "unknown" when it can't tell (e.g. TEI).
+func embedModelName(e EmbeddingClient) string {
+	if mn, ok := e.(ModelNamer); ok {
+		return mn.ModelName()
+	}
+	return "unknown"
+}
+
 // TokenCounter is an optional interface implemented by embedding clients and
 // rerankers that track cumulative token usage reported by their upstream API
 // (e.g. Voyage AI returns usage.total_tokens). core.Service type-asserts the

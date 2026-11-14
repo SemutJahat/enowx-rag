@@ -234,8 +234,12 @@ restricted to localhost or a valid `+"`RAG_ADMIN_TOKEN`"+` bearer token.
 
 func docEmbedders(_, _ string) string {
 	return "# Embedders\n\n" +
-		"Set with `RAG_EMBEDDER`. The embedding model and dimension must stay consistent " +
-		"within a collection — changing them requires re-indexing or a *Migration*.\n\n" +
+		"Set with `RAG_EMBEDDER`. Vectors of different models or dimensions can't be compared, " +
+		"so after you change the model or dimension (and restart), the first search or sync of " +
+		"each project re-embeds the points another model wrote, code chunks and memory notes " +
+		"alike, from their stored text. The built-in SQLite store takes the new vectors in place; " +
+		"a Qdrant collection or pgvector table has a fixed size, so a new dimension there needs " +
+		"a *Migration* to a new collection or table.\n\n" +
 		"## Voyage AI (`voyage`)\nHosted, high quality, free tier. `RAG_VOYAGE_API_KEY`, " +
 		"`RAG_VOYAGE_MODEL` (default `voyage-4`). Also powers reranking (`RAG_RERANKER_MODEL`).\n\n" +
 		"## OpenAI-compatible (`openai`)\nAny `/v1/embeddings` API — OpenAI, Together, Jina, " +
@@ -287,8 +291,12 @@ func docMigration(base, _ string) string {
 		"portable, so migration re-embeds from the text stored alongside every chunk.\n\n" +
 		"## Use cases\n" +
 		"- **Change model / dimension** — pick a new embedder/model/dim; the destination is " +
-		"re-embedded. (For pgvector, a new dimension needs a **new table name**.)\n" +
-		"- **Move between stores** — e.g. Qdrant → pgvector.\n" +
+		"re-embedded. (For pgvector, a new dimension needs a **new table name**.) To change the " +
+		"model of the store you run on, no migration is needed: edit the config and restart; " +
+		"projects are re-embedded in place on their next search or sync.\n" +
+		"- **Move between stores** — e.g. Qdrant → pgvector, or into the built-in SQLite store " +
+		"(`vector_store: sqlite`, optional `sqlite_path`; empty is the running store's file, " +
+		"where the destination project name must differ from the source).\n" +
 		"- **Import from cloud** — Qdrant Cloud is verified; Pinecone, Weaviate, and Chroma Cloud " +
 		"connectors are *experimental* (mock-tested only) and labelled as such in the UI.\n\n" +
 		"## How\nUse the **Migration** page, or `POST /api/migrate`. It runs asynchronously with " +

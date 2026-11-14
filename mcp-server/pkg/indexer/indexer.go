@@ -288,12 +288,16 @@ func (idx *Indexer) listFiles(rootDir string) ([]string, error) {
 
 // SyncResult holds stats from a project sync.
 type SyncResult struct {
-	Indexed      int    `json:"indexed"`           // chunks embedded and stored
-	Updated      int    `json:"updated,omitempty"` // moved chunks refreshed without re-embedding
-	Deleted      int    `json:"deleted"`           // stale chunks removed
-	FilesScanned int    `json:"files_scanned"`
-	Skipped      int    `json:"skipped"` // unchanged chunks
-	StaleError   string `json:"stale_error,omitempty"`
+	Indexed      int `json:"indexed"`           // chunks embedded and stored
+	Updated      int `json:"updated,omitempty"` // moved chunks refreshed without re-embedding
+	Deleted      int `json:"deleted"`           // stale chunks removed
+	FilesScanned int `json:"files_scanned"`
+	Skipped      int `json:"skipped"` // unchanged chunks
+	// Reembedded counts points (chunks and memory notes) embedded again from
+	// their stored text because another embedding model or vector size wrote
+	// them (set by core.Service, which checks the whole project).
+	Reembedded int    `json:"reembedded,omitempty"`
+	StaleError string `json:"stale_error,omitempty"`
 }
 
 // chunkText splits text into chunks of approximately maxChars.
