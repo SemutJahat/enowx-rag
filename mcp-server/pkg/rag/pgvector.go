@@ -213,14 +213,11 @@ func (p *PGVectorProvider) Index(ctx context.Context, projectID string, docs []D
 
 	batch := &pgx.Batch{}
 	for i, d := range docs {
-		id := d.ID
+		id := pgText(d.ID)
 		if id == "" {
 			id = uuid.NewString()
 		}
-		meta := make(map[string]string, len(d.Meta)+2)
-		for k, v := range d.Meta {
-			meta[k] = v
-		}
+		meta := pgMeta(d.Meta, 2)
 		// The embedder that made this vector, over whatever model a migrated
 		// or re-embedded document still names.
 		meta["embed_model"] = embedModel
@@ -232,7 +229,7 @@ ON CONFLICT (project_id, id) DO UPDATE SET
 	content = EXCLUDED.content,
 	metadata = EXCLUDED.metadata,
 	embedding = EXCLUDED.embedding
-`, p.table), id, projectID, d.Content, meta, pgVectorLiteral(vectors[i]))
+`, p.table), id, projectID, pgText(d.Content), meta, pgVectorLiteral(vectors[i]))
 	}
 	br := p.pool.SendBatch(ctx, batch)
 	return br.Close()

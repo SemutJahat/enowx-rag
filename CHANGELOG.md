@@ -94,6 +94,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size a store stamps on the points it writes now.
 
 ### Fixed
+- **Import into pgvector stopped at text that is not UTF-8**: SQLite keeps any
+  bytes, so a file indexed in Windows-1252 (a test fixture, say) or holding a
+  NUL byte made PostgreSQL refuse the batch (`invalid byte sequence for
+  encoding "UTF8"`, SQLSTATE 22021) and the import job ended there. The
+  pgvector store now replaces invalid bytes with U+FFFD and drops NULs in
+  content, metadata and IDs, when indexing and importing alike.
 - **Changing the embedding model left the old vectors in place**: a re-index
   skipped unchanged chunks whatever model embedded them, so after a model
   change searches compared the query with another model's vectors (wrong

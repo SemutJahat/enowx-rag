@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -36,8 +37,8 @@ func (p *PGVectorProvider) UpdatePayload(ctx context.Context, projectID string, 
 	q := fmt.Sprintf(`UPDATE %s SET content = $3, metadata = COALESCE(metadata, '{}'::jsonb) || $4::jsonb
 WHERE project_id = $1 AND id = $2`, p.table)
 	for _, d := range docs {
-		patch, _ := json.Marshal(d.Meta)
-		tag, err := tx.Exec(ctx, q, projectID, d.ID, d.Content, string(patch))
+		patch, _ := json.Marshal(pgMeta(d.Meta, 0))
+		tag, err := tx.Exec(ctx, q, projectID, pgText(d.ID), pgText(d.Content), string(patch))
 		if err != nil {
 			return err
 		}
@@ -59,23 +60,40 @@ func (p *PGVectorProvider) IndexVectors(ctx context.Context, projectID string, d
 		if len(vectors[i]) != p.dim {
 			return fmt.Errorf("index vectors: point %q has %d dimensions, the table stores %d", d.ID, len(vectors[i]), p.dim)
 		}
-		id := d.ID
+		id := pgText(d.ID)
 		if id == "" {
 			id = uuid.NewString()
 		}
-		meta := make(map[string]string, len(d.Meta)+1)
-		for k, v := range d.Meta {
-			meta[k] = v
-		}
+		meta := pgMeta(d.Meta, 1)
 		meta["embed_dim"] = strconv.Itoa(len(vectors[i]))
 		batch.Queue(fmt.Sprintf(`
 INSERT INTO %s (id, project_id, content, metadata, embedding)
 VALUES ($1, $2, $3, $4, $5::vector)
 ON CONFLICT (project_id, id) DO UPDATE SET
 	content = EXCLUDED.content, metadata = EXCLUDED.metadata, embedding = EXCLUDED.embedding
-`, p.table), id, projectID, d.Content, meta, pgVectorLiteral(vectors[i]))
+`, p.table), id, projectID, pgText(d.Content), meta, pgVectorLiteral(vectors[i]))
 	}
 	return p.pool.SendBatch(ctx, batch).Close()
+}
+
+// pgText makes s storable in PostgreSQL, which refuses text that is not valid
+// UTF-8 or holds a NUL byte, both of which SQLite keeps (a file indexed in
+// Windows-1252, say): invalid bytes become U+FFFD and NULs are dropped.
+func pgText(s string) string {
+	if utf8.ValidString(s) && strings.IndexByte(s, 0) < 0 {
+		return s
+	}
+	return strings.ReplaceAll(strings.ToValidUTF8(s, "�"), "\x00", "")
+}
+
+// pgMeta copies metadata with pgText applied to keys and values, leaving room
+// for extra entries.
+func pgMeta(m map[string]string, extra int) map[string]string {
+	out := make(map[string]string, len(m)+extra)
+	for k, v := range m {
+		out[pgText(k)] = pgText(v)
+	}
+	return out
 }
 
 // ExportPointsWithVectors returns every point with its stored vector (nil for
