@@ -94,6 +94,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size a store stamps on the points it writes now.
 
 ### Fixed
+- **`push --project X` showed other projects in its plan**: after X the filter
+  was lost, so every later project was listed (as "project exists: replace"
+  with `--mode replace`) and counted in the re-embed estimate, which could ask
+  about Voyage tokens that were never spent. Only X was imported. The plan
+  now lists the selected projects only, with columns sized to the longest
+  name.
 - **Import into pgvector stopped at text that is not UTF-8**: SQLite keeps any
   bytes, so a file indexed in Windows-1252 (a test fixture, say) or holding a
   NUL byte made PostgreSQL refuse the batch (`invalid byte sequence for

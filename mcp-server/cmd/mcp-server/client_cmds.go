@@ -388,30 +388,11 @@ Point IDs and metadata are kept, so later syncs stay incremental.
 		_ = api.do(context.Background(), http.MethodDelete, "/api/import/upload/"+plan.UploadID, nil, nil, nil)
 	}
 
-	selected := map[string]bool{}
-	for _, p := range projects {
-		selected[p] = true
-	}
-	fmt.Printf("\n%-28s %8s  %-22s %s\n", "PROJECT", "CHUNKS", "EMBEDDED WITH", "ON THE SERVER")
-	reembed := 0
-	for _, p := range plan.Projects {
-		if len(selected) > 0 && !selected[p.ProjectID] {
-			continue
+	reembed, missing := printPlan(os.Stdout, plan, projects, *mode)
+	if len(missing) > 0 {
+		for _, p := range missing {
+			fmt.Fprintf(os.Stderr, "error: project %q is not in %s\n", p, src)
 		}
-		delete(selected, p.ProjectID)
-		how := "vectors reused"
-		if !p.ReuseVectors {
-			how = fmt.Sprintf("%d re-embedded", p.Points-p.ReusePoints)
-			reembed += p.Points - p.ReusePoints
-		}
-		exists := ""
-		if p.Exists {
-			exists = " (project exists: " + *mode + ")"
-		}
-		fmt.Printf("%-28s %8d  %-22s %s%s\n", p.ProjectID, p.Points, fmt.Sprintf("%s/%d", p.EmbedModel, p.EmbedDim), how, exists)
-	}
-	for missing := range selected {
-		fmt.Fprintf(os.Stderr, "error: project %q is not in %s\n", missing, src)
 		discard()
 		return 1
 	}
@@ -510,6 +491,46 @@ const (
 	defaultPartBytes = 32 << 20
 	minPartBytes     = 1 << 20
 )
+
+// printPlan writes the import plan for the selected projects (every project
+// when none is selected) and returns how many chunks the server must embed
+// again and the selected projects the store doesn't hold.
+func printPlan(w io.Writer, plan *importPlan, selected []string, mode string) (reembed int, missing []string) {
+	want := map[string]bool{}
+	for _, p := range selected {
+		want[p] = true
+	}
+	var shown []core.ImportPlanProject
+	width := len("PROJECT")
+	for _, p := range plan.Projects {
+		if len(want) > 0 && !want[p.ProjectID] {
+			continue
+		}
+		shown = append(shown, p)
+		width = max(width, len(p.ProjectID))
+	}
+	fmt.Fprintf(w, "\n%-*s %8s  %-22s %s\n", width, "PROJECT", "CHUNKS", "EMBEDDED WITH", "ON THE SERVER")
+	found := map[string]bool{}
+	for _, p := range shown {
+		found[p.ProjectID] = true
+		how := "vectors reused"
+		if !p.ReuseVectors {
+			how = fmt.Sprintf("%d re-embedded", p.Points-p.ReusePoints)
+			reembed += p.Points - p.ReusePoints
+		}
+		exists := ""
+		if p.Exists {
+			exists = " (project exists: " + mode + ")"
+		}
+		fmt.Fprintf(w, "%-*s %8d  %-22s %s%s\n", width, p.ProjectID, p.Points, fmt.Sprintf("%s/%d", p.EmbedModel, p.EmbedDim), how, exists)
+	}
+	for _, p := range selected {
+		if !found[p] {
+			missing = append(missing, p)
+		}
+	}
+	return reembed, missing
+}
 
 // uploadSnapshot compresses the snapshot and uploads it in parts, printing
 // progress. A part is retried when the connection or the proxy fails, and

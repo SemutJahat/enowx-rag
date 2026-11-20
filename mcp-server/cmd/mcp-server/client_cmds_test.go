@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/enowdev/enowx-rag/mcp-server/pkg/core"
 )
 
 // fakeCloudflare stands in for a server behind Cloudflare: it refuses
@@ -131,6 +133,47 @@ func TestUploadSnapshotThroughSizeLimitedProxy(t *testing.T) {
 	}
 	if _, err := os.Stat(src + ".gz"); !os.IsNotExist(err) {
 		t.Errorf("the compressed temp file is left behind")
+	}
+}
+
+// `push --project X` shows and counts only X: a project after X in the plan
+// must not appear as if it were imported (or replaced).
+func TestPrintPlanShowsOnlySelectedProjects(t *testing.T) {
+	plan := &importPlan{Projects: []core.ImportPlanProject{
+		{ProjectID: "alpha", Points: 10, ReuseVectors: true, ReusePoints: 10, EmbedModel: "voyage-4", EmbedDim: 1024, Exists: true},
+		{ProjectID: "beta-with-a-rather-long-project-name", Points: 5, ReuseVectors: true, ReusePoints: 5, EmbedModel: "voyage-4", EmbedDim: 1024, Exists: true},
+		{ProjectID: "gamma", Points: 7, EmbedModel: "other", EmbedDim: 768},
+	}}
+
+	var buf bytes.Buffer
+	reembed, missing := printPlan(&buf, plan, []string{"alpha"}, "replace")
+	out := buf.String()
+	if !strings.Contains(out, "alpha") || strings.Contains(out, "beta") || strings.Contains(out, "gamma") {
+		t.Errorf("plan for alpha shows other projects:\n%s", out)
+	}
+	if reembed != 0 || len(missing) != 0 {
+		t.Errorf("reembed = %d (gamma counted?), missing = %v", reembed, missing)
+	}
+
+	buf.Reset()
+	if _, missing = printPlan(&buf, plan, []string{"alpha", "nope"}, "merge"); len(missing) != 1 || missing[0] != "nope" {
+		t.Errorf("missing = %v, want [nope]", missing)
+	}
+
+	buf.Reset()
+	reembed, missing = printPlan(&buf, plan, nil, "merge")
+	out = buf.String()
+	if strings.Count(out, "(project exists: merge)") != 2 || !strings.Contains(out, "7 re-embedded") || reembed != 7 || len(missing) != 0 {
+		t.Errorf("full plan: reembed = %d, missing = %v\n%s", reembed, missing, out)
+	}
+	// Columns line up even with a name longer than the default width.
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	col := strings.Index(lines[0], "CHUNKS") + len("CHUNKS")
+	for _, l := range lines[1:] {
+		if len(l) < col || l[col-1] == ' ' {
+			t.Errorf("CHUNKS column misaligned:\n%s", out)
+			break
+		}
 	}
 }
 
