@@ -135,6 +135,12 @@ func NewRouterWithOptions(svc *core.Service, ui fs.FS, mcpHandler http.Handler, 
 			r.Post("/import/upload", h.ImportUpload)
 			r.Post("/import/start", h.ImportStart)
 			r.Delete("/import/upload/{id}", h.ImportDiscard)
+			// The same in parts, for proxies that cap the request size
+			// (Cloudflare: 100 MB per request).
+			r.Post("/import/parts", h.ImportPartsStart)
+			r.Put("/import/parts/{id}", h.ImportPart)
+			r.Post("/import/parts/{id}/finish", h.ImportPartsFinish)
+			r.Delete("/import/parts/{id}", h.ImportDiscard)
 
 			r.Get("/setup/config", h.SetupConfig) // masked config (no full secrets)
 			r.Get("/setup/mcp-snippet", h.SetupMCPSnippet)

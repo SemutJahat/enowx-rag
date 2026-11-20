@@ -174,6 +174,45 @@ Without Docker, run the binary under systemd:
 [`deploy/enowx-rag.service`](deploy/enowx-rag.service) (pgvector DSN and token in
 `/etc/enowx-rag.env`, your own HTTPS proxy in front).
 
+### Dokploy (or another Docker host with its own proxy)
+
+Dokploy runs `docker-compose.vps.yml` as a Compose service behind its own
+Traefik with HTTPS, so the Caddy profile stays off:
+
+1. **Create Service → Compose**, provider Git/GitHub: this repository, branch
+   `main`, compose path `./docker-compose.vps.yml`.
+2. **Advanced → Isolated Deployments: on.** Without it only the service with a
+   domain joins Dokploy's network, and enowx-rag can't resolve `postgres`.
+3. **Environment**: `POSTGRES_PASSWORD` (letters and digits,
+   `openssl rand -hex 24`), `RAG_ADMIN_TOKEN` (`openssl rand -hex 32`);
+   optionally `RAG_VOYAGE_API_KEY`, `ENOWX_WEB_BUILD=prebuilt` on a small
+   server, `ENOWX_PORT` when 7777 is taken on the host.
+4. **Domains**: your host name, service `enowx-rag`, container port `7777`,
+   HTTPS on (Let's Encrypt, or no certificate when Cloudflare connects with an
+   origin certificate already installed in Dokploy).
+5. **Deploy** and open the domain: the setup wizard asks for the Voyage key.
+
+Data lives in the named volumes `pg-data` and `enowx-data` and survives
+redeploys. The dashboard is also published on the host's `127.0.0.1:7777`
+only (handy for an SSH tunnel).
+
+### Behind Cloudflare
+
+- Proxied record, SSL/TLS **Full (strict)**, a certificate for the name on the
+  server (a Cloudflare Origin Certificate works).
+- Free and Pro plans accept at most **100 MB per request**: `push` and the
+  dashboard's Import send stores in 32 MiB parts (a part a proxy still refuses
+  is split, a failed one retried), so any size fits.
+- Cloudflare waits at most 100 s for an answer; imports, re-index and
+  re-embedding run as jobs, and the live event stream sends a heartbeat every
+  30 s.
+- Keep Bot Fight Mode, challenges and Cloudflare Access away from `/api` and
+  `/mcp` (MCP clients can't solve them); clients send
+  `User-Agent: enowx-rag/<version>` for a WAF skip rule.
+- A request blocked by Cloudflare or another proxy is reported as such (with
+  the Ray ID) by `connect`, `push`, client mode and the dashboard, not as a bad
+  token.
+
 ### Onboarding
 
 Open the dashboard and sign in with the admin token. The setup wizard:
@@ -211,13 +250,14 @@ enowx-rag push --remote https://rag.example.com --token <RAG_ADMIN_TOKEN>
 ```
 
 `push` snapshots `~/.enowx-rag/rag.db` (safe while agents use it), uploads it
-gzip-compressed, shows per project how many chunks keep their vectors, imports
+gzip-compressed in 32 MiB parts (fits behind Cloudflare's 100 MB request
+limit; failed parts are retried), shows per project how many chunks keep their vectors, imports
 them as a server job and registers each project's folder so auto-sync carries
 on. Vectors from the server's model and dimension are copied as they are (the
 voyage-4 family shares one embedding space, so those are reused across its
 models); the rest are re-embedded from text, after showing the token estimate
 (`--yes` skips the question). Options: `--project ID` (repeatable),
-`--mode replace`, `--file other.db`. The dashboard's **Import** page does the
+`--mode replace`, `--file other.db`, `--part-mb N`. The dashboard's **Import** page does the
 same from the browser.
 
 A server configured for pgvector that finds a SQLite store next to its config
@@ -294,6 +334,9 @@ When running in `--serve` mode, the following REST endpoints are available:
 | `GET` | `/api/events` | SSE stream of the same events, live |
 | `GET` | `/api/jobs`, `/api/jobs/{id}` | Background jobs (re-index, import, startup) |
 | `POST` | `/api/import/upload` | Upload a SQLite store (raw or gzip); returns the import plan and cost |
+| `POST` | `/api/import/parts` | Start an upload in parts (for proxies that cap request size, e.g. Cloudflare's 100 MB) |
+| `PUT` | `/api/import/parts/{id}?offset=N` | Next part from byte N → `{received}` (409 `{received}` on a wrong offset) |
+| `POST` | `/api/import/parts/{id}/finish?size=N` | Read the upload; same answer as `/api/import/upload` |
 | `POST` | `/api/import/start` | Start the import (`{"upload_id", "projects"?, "mode"?: "merge"\|"replace"}`) |
 | `GET` | `/api/setup/status` | Configured? Missing settings, env-locked keys (always open) |
 | `GET` | `/api/setup/detect` | What the server finds on its own (database, key, old SQLite store) 🔒 |

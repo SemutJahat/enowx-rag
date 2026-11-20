@@ -215,6 +215,26 @@ Re-run it to update; `+"`"+`.env`+"`"+` is kept. On a VPS with less than 2 GB of
 
 Without Docker: run `+"`"+`enowx-rag --serve`+"`"+` under systemd (`+"`"+`deploy/enowx-rag.service`+"`"+`) with `+"`"+`RAG_VECTOR_STORE=pgvector`+"`"+`, `+"`"+`RAG_PGVECTOR_DSN`+"`"+` and `+"`"+`RAG_ADMIN_TOKEN`+"`"+` in its environment, behind your own HTTPS proxy.
 
+## Dokploy (or another Docker host with its own proxy)
+
+Dokploy runs `+"`"+`docker-compose.vps.yml`+"`"+` as a Compose service and puts its own Traefik with HTTPS in front, so the Caddy profile stays off.
+
+1. **Create Service → Compose**, provider Git or GitHub: this repository, branch `+"`"+`main`+"`"+`, compose path `+"`"+`./docker-compose.vps.yml`+"`"+`.
+2. **Advanced → Isolated Deployments: on.** Without it only the service that has a domain joins Dokploy's network, and enowx-rag can't resolve `+"`"+`postgres`+"`"+`.
+3. **Environment**: `+"`"+`POSTGRES_PASSWORD`+"`"+` (letters and digits, e.g. `+"`"+`openssl rand -hex 24`+"`"+`), `+"`"+`RAG_ADMIN_TOKEN`+"`"+` (`+"`"+`openssl rand -hex 32`+"`"+`); optionally `+"`"+`RAG_VOYAGE_API_KEY`+"`"+`, `+"`"+`ENOWX_WEB_BUILD=prebuilt`+"`"+` on a small server, and `+"`"+`ENOWX_PORT`+"`"+` when 7777 is taken on the host.
+4. **Domains**: the host name (e.g. `+"`"+`rag.example.com`+"`"+`), service `+"`"+`enowx-rag`+"`"+`, container port `+"`"+`7777`+"`"+`, HTTPS on: Let's Encrypt, or no certificate when Cloudflare connects with an origin certificate already installed in Dokploy.
+5. **Deploy**, then open the domain: the setup wizard asks for the Voyage key and models.
+
+Data lives in the named volumes `+"`"+`pg-data`+"`"+` and `+"`"+`enowx-data`+"`"+` and survives redeploys. The dashboard is also published on the host's `+"`"+`127.0.0.1:7777`+"`"+` only: not reachable from outside, handy for an SSH tunnel.
+
+## Behind Cloudflare
+
+- Proxied DNS record for the host, SSL/TLS mode **Full (strict)**, and a certificate on the server for that name (a Cloudflare Origin Certificate works).
+- Cloudflare's Free and Pro plans accept at most 100 MB per request. `+"`"+`push`+"`"+` and the dashboard's **Import** send stores in 32 MiB parts, so any size fits; a part that a proxy still refuses is split in half, and a failed part is retried.
+- Cloudflare waits at most 100 seconds for an answer. Long work (imports, re-index, re-embedding) runs as jobs that clients follow, and the live activity stream sends a heartbeat every 30 seconds.
+- Keep Bot Fight Mode, challenges and Cloudflare Access away from `+"`"+`/api`+"`"+` and `+"`"+`/mcp`+"`"+`: MCP clients and `+"`"+`push`+"`"+` can't solve them. They identify as `+"`"+`User-Agent: enowx-rag/<version>`+"`"+`, which a WAF skip rule can match.
+- When Cloudflare (or another proxy) blocks a request, `+"`"+`connect`+"`"+`, `+"`"+`push`+"`"+`, client mode and the dashboard say so, with the Ray ID, instead of calling it a bad token.
+
 ## Onboarding
 
 The first visit opens the setup wizard:
@@ -273,19 +293,21 @@ The dashboard's **Connect** page shows the same commands and snippets per client
     enowx-rag push --remote {{BASE}} --token <ADMIN_TOKEN>
 
 1. Takes a consistent snapshot of `+"`"+`~/.enowx-rag/rag.db`+"`"+` (safe while agents use it).
-2. Uploads it gzip-compressed, with progress.
+2. Uploads it gzip-compressed in 32 MiB parts, with progress: it fits behind Cloudflare's 100 MB request limit, and a failed part is retried.
 3. Shows the plan per project: chunks, and how many keep their vectors.
 4. Imports into the server's store as a job and follows it.
 5. Tells the server where each project's folder is, so auto-sync carries on.
 
 Vectors made by the server's embedding model at its dimension are copied as they are; the voyage-4 family (voyage-4-large, voyage-4, voyage-4-lite) shares one embedding space, so those are reused across models too. Other chunks are embedded again from their text; `+"`"+`push`+"`"+` shows the token estimate and asks first (`+"`"+`--yes`+"`"+` skips the question).
 
-Options: `+"`"+`--file other.db`+"`"+`, `+"`"+`--project ID`+"`"+` (repeatable), `+"`"+`--mode replace`+"`"+` (delete the server's copy of each project first; default `+"`"+`merge`+"`"+`).
+Options: `+"`"+`--file other.db`+"`"+`, `+"`"+`--project ID`+"`"+` (repeatable), `+"`"+`--mode replace`+"`"+` (delete the server's copy of each project first; default `+"`"+`merge`+"`"+`), `+"`"+`--part-mb N`+"`"+` (part size; default 32).
 
-From the dashboard: **Import** → choose `+"`"+`rag.db`+"`"+` → review the plan → start. With curl:
+From the dashboard: **Import** → choose `+"`"+`rag.db`+"`"+` (or `+"`"+`rag.db.gz`+"`"+`) → review the plan → start; it uploads in parts too. With curl, for a store that fits in one request:
 
     curl -H "Authorization: Bearer $TOKEN" --data-binary @rag.db {{BASE}}/api/import/upload
     curl -H "Authorization: Bearer $TOKEN" -d '{"upload_id":"u_…","mode":"merge"}' {{BASE}}/api/import/start
+
+Bigger stores behind a proxy: `+"`"+`POST /api/import/parts`+"`"+` → `+"`"+`PUT /api/import/parts/{id}?offset=N`+"`"+` per part → `+"`"+`POST /api/import/parts/{id}/finish?size=TOTAL`+"`"+` (see the API reference).
 
 ## Automatic conversion on the server
 
@@ -373,6 +395,9 @@ All endpoints are under {{BASE}}/api. When an admin token is set (`+"`"+`RAG_ADM
 - `+"`"+`POST /api/import/upload`+"`"+` — body: a SQLite store, raw or gzip; returns the plan + cost estimate
 - `+"`"+`POST /api/import/start`+"`"+` — `+"`"+`{upload_id, projects?, mode?: merge|replace, rename?}`+"`"+`; a job
 - `+"`"+`DELETE /api/import/upload/{id}`+"`"+` — discard an upload (they expire after an hour)
+- `+"`"+`POST /api/import/parts`+"`"+` — start an upload in parts (for proxies that cap the request size); returns `+"`"+`{upload_id, part_bytes}`+"`"+`
+- `+"`"+`PUT /api/import/parts/{id}?offset=N`+"`"+` — the next part, starting at byte N; returns `+"`"+`{received}`+"`"+`, or 409 `+"`"+`{received}`+"`"+` when N is not what the server holds
+- `+"`"+`POST /api/import/parts/{id}/finish?size=TOTAL`+"`"+` — read the upload; returns the same plan as `+"`"+`/import/upload`+"`"+`
 
 ## Setup & settings
 - `+"`"+`GET /api/setup/status`+"`"+` — configured? what's missing, env-locked keys (open)

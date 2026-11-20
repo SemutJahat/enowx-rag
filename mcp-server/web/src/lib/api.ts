@@ -72,11 +72,17 @@ export function authHeaders(token: string = getToken()): Record<string, string> 
 export class ApiError extends Error {
   status: number
   hint?: string
-  constructor(message: string, status: number, hint?: string) {
+  /** The answer came from a proxy/CDN in front of enowx-rag, not from it. */
+  proxy: boolean
+  /** The parsed JSON body of the error, when there is one. */
+  data?: Record<string, unknown>
+  constructor(message: string, status: number, hint?: string, opts: { proxy?: boolean; data?: Record<string, unknown> } = {}) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.hint = hint
+    this.proxy = !!opts.proxy
+    this.data = opts.data
   }
 }
 
@@ -88,7 +94,8 @@ export function errorText(e: unknown, fallback = 'Request failed'): string {
 }
 
 export function isAuthError(e: unknown): boolean {
-  return e instanceof ApiError && (e.status === 401 || e.status === 403)
+  // A proxy's 403 (Cloudflare WAF, IP allowlist) is not about the token.
+  return e instanceof ApiError && !e.proxy && (e.status === 401 || e.status === 403)
 }
 
 function notifyUnauthorized() {
@@ -96,16 +103,72 @@ function notifyUnauthorized() {
 }
 
 async function parseError(resp: Response): Promise<ApiError> {
-  let msg = `HTTP ${resp.status}`
-  let hint: string | undefined
+  const text = await resp.text().catch(() => '')
+  return errorFrom(resp.status, text, (h) => resp.headers.get(h))
+}
+
+/**
+ * Turn an error answer into an ApiError. enowx-rag's own errors are JSON
+ * ({error, hint}); anything else came from a proxy or CDN in front of it
+ * (Cloudflare, Traefik, nginx) and is explained as such.
+ */
+function errorFrom(status: number, text: string, header: (name: string) => string | null): ApiError {
+  let body: unknown
   try {
-    const body = await resp.json()
-    if (body && typeof body.error === 'string') msg = body.error
-    if (body && typeof body.hint === 'string') hint = body.hint
+    body = text ? JSON.parse(text) : undefined
   } catch {
-    // not JSON
+    body = undefined
   }
-  return new ApiError(msg, resp.status, hint)
+  if (body && typeof body === 'object') {
+    const b = body as Record<string, unknown>
+    if (typeof b.error === 'string') {
+      return new ApiError(b.error, status, typeof b.hint === 'string' ? b.hint : undefined, { data: b })
+    }
+  }
+  const p = proxyProblem(status, header)
+  return new ApiError(p.message, status, p.hint, { proxy: true })
+}
+
+function proxyProblem(status: number, header: (name: string) => string | null): { message: string; hint?: string } {
+  const rayHeader = header('cf-ray')
+  const cf = !!rayHeader || (header('server') || '').toLowerCase() === 'cloudflare'
+  const who = cf ? 'Cloudflare' : 'A proxy in front of enowx-rag'
+  const ray = rayHeader ? ` Ray ID ${rayHeader.split('-')[0]}.` : ''
+  const origin: Record<number, string> = {
+    520: 'the server sent an empty or invalid answer',
+    521: 'the server refused the connection (is its reverse proxy running?)',
+    522: 'the connection to the server timed out (a firewall may drop Cloudflare’s IPs)',
+    523: 'the server is unreachable (check the DNS record’s IP)',
+    524: 'the server took longer than 100 seconds to answer',
+    525: 'the TLS handshake with the server failed',
+    526: 'the server’s certificate is not valid for SSL mode Full (strict)',
+    530: 'Cloudflare cannot reach the server (DNS record missing?)',
+  }
+  if (cf && origin[status]) {
+    return { message: `Cloudflare could not reach enowx-rag (HTTP ${status})`, hint: `${origin[status]}.${ray}` }
+  }
+  switch (status) {
+    case 413:
+      return {
+        message: `${who} refused the request as too large (HTTP 413)`,
+        hint: `${cf ? 'Cloudflare Free and Pro accept 100 MB per request.' : 'The proxy caps the request size.'}${ray}`,
+      }
+    case 403:
+      return {
+        message: `${who} blocked the request before it reached enowx-rag (HTTP 403)`,
+        hint: `Not a token problem: check the WAF/firewall rules, IP allowlists and bot protection for this hostname.${ray}`,
+      }
+    case 429:
+      return { message: `${who} rate-limited the request (HTTP 429)`, hint: `Wait a moment and try again.${ray}` }
+    case 502:
+    case 503:
+    case 504:
+      return {
+        message: `enowx-rag is not answering behind the proxy (HTTP ${status})`,
+        hint: `It may be restarting or down — check the container logs.${ray}`,
+      }
+  }
+  return { message: `HTTP ${status}`, hint: `${who} answered with a page instead of enowx-rag’s JSON.${ray}` }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,40 +573,42 @@ async function request<T>(path: string, opts: RequestOpts = {}, retried = false)
 
 const enc = encodeURIComponent
 
+/** Suggested part size; the server's answer wins. Well under Cloudflare's 100 MB. */
+const PART_BYTES = 32 * 1024 * 1024
+const MIN_PART_BYTES = 1024 * 1024
+
 /**
- * Upload a SQLite store with progress reporting. XMLHttpRequest (not fetch)
- * because only XHR exposes upload progress events.
+ * Send one request with upload progress. XMLHttpRequest (not fetch) because
+ * only XHR exposes upload progress events.
  */
-function uploadImport(
-  file: Blob,
-  onProgress: (loaded: number, total: number) => void,
-  opts: { signal?: AbortSignal; gzip?: boolean } = {},
-): Promise<ImportUploadResponse> {
-  const { signal, gzip } = opts
+function xhrSend<T>(
+  method: string,
+  path: string,
+  body: Blob,
+  headers: Record<string, string>,
+  onProgress: (loaded: number) => void,
+  signal?: AbortSignal,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', `${API_BASE}/import/upload`)
+    xhr.open(method, `${API_BASE}${path}`)
     const token = getToken()
     if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
-    if (gzip) xhr.setRequestHeader('Content-Encoding', 'gzip')
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress(e.loaded, e.total)
-    }
+    for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v)
+    xhr.upload.onprogress = (e) => onProgress(e.loaded)
     xhr.onload = () => {
-      let parsed: unknown = undefined
-      try {
-        parsed = xhr.responseText ? JSON.parse(xhr.responseText) : undefined
-      } catch {
-        // not JSON
-      }
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(parsed as ImportUploadResponse)
+        try {
+          resolve((xhr.responseText ? JSON.parse(xhr.responseText) : undefined) as T)
+        } catch {
+          reject(new ApiError('The server answered with a page instead of JSON', xhr.status,
+            'A login page or another site sits in front of enowx-rag.', { proxy: true }))
+        }
         return
       }
-      if (xhr.status === 401) notifyUnauthorized()
-      const b = (parsed || {}) as { error?: string; hint?: string }
-      reject(new ApiError(b.error || `HTTP ${xhr.status}`, xhr.status, b.hint))
+      const err = errorFrom(xhr.status, xhr.responseText, (h) => xhr.getResponseHeader(h))
+      if (xhr.status === 401 && !err.proxy) notifyUnauthorized()
+      reject(err)
     }
     xhr.onerror = () => reject(new ApiError('Network error during upload', 0, 'Check the connection to the server and try again.'))
     xhr.onabort = () => reject(new ApiError('Upload cancelled', 0))
@@ -554,8 +619,80 @@ function uploadImport(
       }
       signal.addEventListener('abort', () => xhr.abort(), { once: true })
     }
-    xhr.send(file)
+    xhr.send(body)
   })
+}
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const t = setTimeout(resolve, ms)
+    signal?.addEventListener('abort', () => {
+      clearTimeout(t)
+      reject(new ApiError('Upload cancelled', 0))
+    }, { once: true })
+  })
+
+/**
+ * Upload a SQLite store (raw or .gz) with progress. It goes in parts so that
+ * no single request exceeds a proxy's limit (Cloudflare: 100 MB); a part is
+ * retried when the connection drops and split when a proxy refuses its size.
+ * Servers without part uploads get the file in one request.
+ */
+async function uploadImport(
+  file: Blob,
+  onProgress: (loaded: number, total: number) => void,
+  opts: { signal?: AbortSignal; gzip?: boolean } = {},
+): Promise<ImportUploadResponse> {
+  const { signal, gzip } = opts
+  let start: { upload_id: string; part_bytes?: number; max_part_bytes?: number }
+  try {
+    start = await request('/import/parts', { method: 'POST', signal })
+  } catch (e) {
+    if (e instanceof ApiError && !e.proxy && (e.status === 404 || e.status === 405)) {
+      const headers: Record<string, string> = { 'Content-Type': 'application/octet-stream' }
+      if (gzip) headers['Content-Encoding'] = 'gzip'
+      return xhrSend('POST', '/import/upload', file, headers, (n) => onProgress(n, file.size), signal)
+    }
+    throw e
+  }
+  const id = enc(start.upload_id)
+  let part = Math.min(start.part_bytes || PART_BYTES, start.max_part_bytes || Infinity)
+  let offset = 0
+  let fails = 0
+  try {
+    while (offset < file.size) {
+      const end = Math.min(offset + part, file.size)
+      const from = offset
+      try {
+        const r = await xhrSend<{ received: number }>('PUT', `/import/parts/${id}?offset=${from}`, file.slice(from, end),
+          { 'Content-Type': 'application/octet-stream' }, (n) => onProgress(from + n, file.size), signal)
+        offset = r.received
+        fails = 0
+      } catch (e) {
+        if (signal?.aborted || !(e instanceof ApiError)) throw e
+        if (e.status === 413 && part > MIN_PART_BYTES) {
+          part = Math.max(Math.floor(part / 2), MIN_PART_BYTES)
+          continue
+        }
+        if (e.status === 409 && typeof e.data?.received === 'number') {
+          offset = e.data.received
+          continue
+        }
+        const transient = [0, 408, 429, 502, 503, 504, 520, 521, 522, 523, 524, 530].includes(e.status)
+        if (transient && e.message !== 'Upload cancelled' && fails < 5) {
+          fails++
+          await sleep(fails * fails * 1000, signal)
+          continue
+        }
+        throw e
+      }
+    }
+    onProgress(file.size, file.size)
+    return await request<ImportUploadResponse>(`/import/parts/${id}/finish?size=${file.size}`, { method: 'POST', signal })
+  } catch (e) {
+    request(`/import/parts/${id}`, { method: 'DELETE' }).catch(() => {})
+    throw e
+  }
 }
 
 // ---------------------------------------------------------------------------

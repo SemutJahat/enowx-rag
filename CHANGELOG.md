@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Uploads in parts**: `push` and the dashboard's Import send stores in 32 MiB
+  parts (`POST /api/import/parts`, `PUT …/{id}?offset=N`, `POST …/finish`), so
+  stores larger than a proxy's request limit (Cloudflare Free/Pro: 100 MB) go
+  through. A part a proxy refuses as too large is split, a failed part is
+  retried, and a lost answer is resumed from what the server holds
+  (`push --part-mb N` sets the size).
+- **Proxy-aware errors**: answers from Cloudflare or another proxy in front of
+  the server (WAF 403, 413, 52x, a login page) are explained as such, with the
+  Ray ID, in `connect`, `push`, client mode and the dashboard, instead of
+  "the token was rejected". Clients send `User-Agent: enowx-rag/<version>`.
+- **Dokploy and Cloudflare docs** (README and the in-app Deploy page).
 - **VPS deployment**: `deploy/install-vps.sh` (Docker, generated secrets,
   optional HTTPS through Caddy, health wait), `docker-compose.vps.yml`
   (PostgreSQL 17 + pgvector, not published; token required),

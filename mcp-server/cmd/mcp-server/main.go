@@ -249,6 +249,7 @@ type DeletePointsInput struct {
 }
 
 func main() {
+	rag.SetClientVersion(resolvedVersion())
 	// Subcommand dispatch (must run before flag.Parse, which only handles the
 	// default mode's flags). `enowx-rag setup [--run]` generates/runs the
 	// docker-compose backend from the command line — never over HTTP.

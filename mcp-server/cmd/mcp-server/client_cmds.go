@@ -21,6 +21,7 @@ import (
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/config"
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/core"
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/httpapi"
+	"github.com/enowdev/enowx-rag/mcp-server/pkg/rag"
 	_ "modernc.org/sqlite"
 )
 
@@ -76,14 +77,42 @@ func newAPIClient(base, token string) *apiClient {
 }
 
 func (c *apiClient) do(ctx context.Context, method, path string, body io.Reader, hdr map[string]string, out any) error {
+	return c.send(ctx, method, path, body, -1, hdr, out)
+}
+
+// apiError is an error answer from the server, or from a proxy in front of
+// it; Status lets callers react (split a part on 413, resume on 409).
+type apiError struct {
+	Status int
+	Msg    string
+	Body   []byte
+}
+
+func (e *apiError) Error() string { return e.Msg }
+
+// statusOf is the HTTP status behind err, or 0 when there was no answer.
+func statusOf(err error) int {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		return ae.Status
+	}
+	return 0
+}
+
+// send is do with a known body size (Content-Length; size < 0 = unknown).
+func (c *apiClient) send(ctx context.Context, method, path string, body io.Reader, size int64, hdr map[string]string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return err
+	}
+	if size >= 0 && body != nil {
+		req.ContentLength = size
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 	req.Header.Set("X-Enowx-Client", c.host)
+	req.Header.Set("User-Agent", rag.UserAgent)
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
@@ -92,24 +121,33 @@ func (c *apiClient) do(ctx context.Context, method, path string, body io.Reader,
 		return fmt.Errorf("cannot reach %s: %v", c.base, err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("the server rejected the token (401) — use the admin token you log in to the dashboard with")
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	fail := func(msg string) error { return &apiError{Status: resp.StatusCode, Msg: msg, Body: data} }
+	// A proxy's error page first: a Cloudflare WAF block is a 403, and calling
+	// it a token problem sends people the wrong way.
+	if msg := rag.ProxyProblem(resp.StatusCode, resp.Header, data); msg != "" {
+		return fail(msg)
 	}
-	if resp.StatusCode == http.StatusNotFound && strings.HasPrefix(path, "/api/import") {
-		return fmt.Errorf("the server at %s has no import API — update it to this version of enowx-rag", c.base)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fail("the server rejected the token (401) — use the admin token you log in to the dashboard with")
 	}
 	if resp.StatusCode >= 300 {
 		var e struct{ Error, Hint string }
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			if e.Hint != "" {
-				return fmt.Errorf("%s (%s)", e.Error, e.Hint)
+			if resp.StatusCode == http.StatusNotFound && e.Error == "API endpoint not found" && strings.HasPrefix(path, "/api/import") {
+				return fail(fmt.Sprintf("the server at %s has no import API — update it to this version of enowx-rag", c.base))
 			}
-			return errors.New(e.Error)
+			if e.Hint != "" {
+				return fail(fmt.Sprintf("%s (%s)", e.Error, e.Hint))
+			}
+			return fail(e.Error)
 		}
-		return fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
+		return fail(fmt.Sprintf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(data))))
 	}
 	if out != nil {
+		if msg := rag.NotJSONProblem(resp.Header, data); msg != "" {
+			return fail(msg)
+		}
 		return json.Unmarshal(data, out)
 	}
 	return nil
@@ -123,6 +161,9 @@ func (c *apiClient) checkServer(ctx context.Context) (string, error) {
 		AuthRequired bool   `json:"auth_required"`
 	}
 	if err := c.do(ctx, http.MethodGet, "/api/health", nil, nil, &health); err != nil {
+		if statusOf(err) != 0 {
+			return "", err // an answer, already explained (proxy page, old server…)
+		}
 		return "", fmt.Errorf("%v — is the URL right and the server running?", err)
 	}
 	if health.AuthRequired && c.token == "" {
@@ -284,6 +325,7 @@ func runPush(args []string) int {
 	fs.Var(&projects, "project", "push only this project (repeatable; default: all)")
 	mode := fs.String("mode", "merge", "merge (add/update chunks) or replace (delete the server's copy of each project first)")
 	yes := fs.Bool("yes", false, "don't ask before chunks are embedded again (costs Voyage tokens)")
+	partMB := fs.Int("part-mb", 0, "upload in parts of this many MB (default: the server's suggestion, 32; parts a proxy refuses as too large are split automatically)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: enowx-rag push --remote URL --token TOKEN [--project ID]... [--mode merge|replace] [--yes]
 
@@ -337,7 +379,7 @@ Point IDs and metadata are kept, so later syncs stay incremental.
 	}
 	defer os.Remove(snap)
 
-	plan, err := uploadSnapshot(ctx, api, snap)
+	plan, err := uploadSnapshot(ctx, api, snap, int64(*partMB)<<20)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: upload:", err)
 		return 1
@@ -461,31 +503,199 @@ func snapshotSQLite(src string) (string, error) {
 	return path, nil
 }
 
-// uploadSnapshot gzips and uploads the snapshot, printing progress.
-func uploadSnapshot(ctx context.Context, api *apiClient, path string) (*importPlan, error) {
-	f, err := os.Open(path)
+// Uploads go in parts so that a proxy in front of the server never sees one
+// big request: Cloudflare accepts at most 100 MB per request on its Free and
+// Pro plans, and a 185 MB store is still ~116 MB gzip-compressed.
+const (
+	defaultPartBytes = 32 << 20
+	minPartBytes     = 1 << 20
+)
+
+// uploadSnapshot compresses the snapshot and uploads it in parts, printing
+// progress. A part is retried when the connection or the proxy fails, and
+// split in half when a proxy refuses it as too large. partBytes 0 uses the
+// server's suggestion.
+func uploadSnapshot(ctx context.Context, api *apiClient, path string, partBytes int64) (*importPlan, error) {
+	gz, size, err := gzipFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("compress: %w", err)
+	}
+	defer os.Remove(gz)
+
+	var start struct {
+		UploadID     string `json:"upload_id"`
+		PartBytes    int64  `json:"part_bytes"`
+		MaxPartBytes int64  `json:"max_part_bytes"`
+	}
+	if err := api.do(ctx, http.MethodPost, "/api/import/parts", nil, nil, &start); err != nil {
+		if s := statusOf(err); s == http.StatusNotFound || s == http.StatusMethodNotAllowed {
+			return uploadWhole(ctx, api, gz, size) // a server without part uploads
+		}
+		return nil, err
+	}
+	id := start.UploadID
+	discard := func() {
+		_ = api.do(context.Background(), http.MethodDelete, "/api/import/upload/"+url.PathEscape(id), nil, nil, nil)
+	}
+	part := partBytes
+	if part <= 0 {
+		part = start.PartBytes
+	}
+	if part <= 0 {
+		part = defaultPartBytes
+	}
+	if start.MaxPartBytes > 0 && part > start.MaxPartBytes {
+		part = start.MaxPartBytes
+	}
+	parts := (size + part - 1) / part
+	word := "parts"
+	if parts == 1 {
+		word = "part"
+	}
+	fmt.Printf("  uploading %.1f MB in %d %s of up to %s\n", float64(size)/1e6, parts, word, mbText(part))
+
+	f, err := os.Open(gz)
+	if err != nil {
+		discard()
+		return nil, err
+	}
+	defer f.Close()
+	var offset int64
+	fails := 0
+	for offset < size {
+		n := min(part, size-offset)
+		body := &progressReader{r: io.NewSectionReader(f, offset, n), total: size, done: offset, label: "uploading"}
+		var got struct {
+			Received int64 `json:"received"`
+		}
+		pctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+		err := api.send(pctx, http.MethodPut, fmt.Sprintf("/api/import/parts/%s?offset=%d", url.PathEscape(id), offset),
+			body, n, map[string]string{"Content-Type": "application/octet-stream"}, &got)
+		cancel()
+		if err == nil {
+			offset, fails = got.Received, 0
+			continue
+		}
+		if ctx.Err() != nil {
+			discard()
+			return nil, ctx.Err()
+		}
+		switch s := statusOf(err); {
+		case s == http.StatusRequestEntityTooLarge && part > minPartBytes:
+			part = max(part/2, minPartBytes)
+			fmt.Printf("\n! %v\n  continuing with parts of %s\n", err, mbText(part))
+			continue
+		case s == http.StatusConflict:
+			// The server holds a different amount than we thought (a retried
+			// part that did arrive): carry on from what it has.
+			var e struct {
+				Received *int64 `json:"received"`
+			}
+			var ae *apiError
+			if errors.As(err, &ae) && json.Unmarshal(ae.Body, &e) == nil && e.Received != nil {
+				offset = *e.Received
+				continue
+			}
+		case retryable(s) && fails < 5:
+			fails++
+			wait := time.Duration(fails*fails) * time.Second
+			fmt.Printf("\n! %v\n  retrying in %s\n", err, wait)
+			select {
+			case <-ctx.Done():
+				discard()
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
+		discard()
+		return nil, err
+	}
+	fmt.Println()
+	fmt.Println("  the server is reading the store…")
+	var plan importPlan
+	if err := api.do(ctx, http.MethodPost, fmt.Sprintf("/api/import/parts/%s/finish?size=%d", url.PathEscape(id), size), nil, nil, &plan); err != nil {
+		discard()
+		return nil, err
+	}
+	return &plan, nil
+}
+
+// retryable reports whether an upload part that failed with HTTP status s
+// (0 = no answer) is worth sending again.
+func retryable(s int) bool {
+	switch s {
+	case 0, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout, 520, 521, 522, 523, 524, 530:
+		return true
+	}
+	return false
+}
+
+// uploadWhole sends the compressed snapshot in one request (servers without
+// part uploads).
+func uploadWhole(ctx context.Context, api *apiClient, gz string, size int64) (*importPlan, error) {
+	f, err := os.Open(gz)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	st, _ := f.Stat()
-	pr, pw := io.Pipe()
-	go func() {
-		zw := gzip.NewWriter(pw)
-		_, err := io.Copy(zw, &progressReader{r: f, total: st.Size(), label: "uploading"})
-		if cerr := zw.Close(); err == nil {
-			err = cerr
-		}
-		pw.CloseWithError(err)
-	}()
 	var plan importPlan
-	err = api.do(ctx, http.MethodPost, "/api/import/upload", pr,
+	err = api.send(ctx, http.MethodPost, "/api/import/upload", &progressReader{r: f, total: size, label: "uploading"}, size,
 		map[string]string{"Content-Type": "application/octet-stream", "Content-Encoding": "gzip"}, &plan)
 	fmt.Println()
 	if err != nil {
+		if statusOf(err) == http.StatusRequestEntityTooLarge {
+			err = fmt.Errorf("%w — update the server: newer versions take uploads in parts", err)
+		}
 		return nil, err
 	}
 	return &plan, nil
+}
+
+// gzipFile compresses path into path+".gz" and returns that file and its size.
+func gzipFile(path string) (string, int64, error) {
+	src, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer src.Close()
+	st, err := src.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	out := path + ".gz"
+	dst, err := os.OpenFile(out, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", 0, err
+	}
+	zw := gzip.NewWriter(dst)
+	_, err = io.Copy(zw, &progressReader{r: src, total: st.Size(), label: "compressing"})
+	if cerr := zw.Close(); err == nil {
+		err = cerr
+	}
+	if cerr := dst.Close(); err == nil {
+		err = cerr
+	}
+	fmt.Println()
+	if err != nil {
+		os.Remove(out)
+		return "", 0, err
+	}
+	gst, err := os.Stat(out)
+	if err != nil {
+		os.Remove(out)
+		return "", 0, err
+	}
+	fmt.Printf("✓ compressed %.1f MB → %.1f MB\n", float64(st.Size())/1e6, float64(gst.Size())/1e6)
+	return out, gst.Size(), nil
+}
+
+func mbText(n int64) string {
+	if n%(1<<20) == 0 {
+		return fmt.Sprintf("%d MiB", n>>20)
+	}
+	return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
 }
 
 // followJob polls a server job until it finishes, printing its progress.

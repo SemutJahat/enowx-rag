@@ -91,14 +91,20 @@ func (p *RemoteProvider) do(ctx context.Context, method, path string, body, out 
 		req.Header.Set("Authorization", "Bearer "+p.token)
 	}
 	req.Header.Set("X-Enowx-Client", p.host)
+	req.Header.Set("User-Agent", UserAgent)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("cannot reach the enowx-rag server: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("the server rejected the token (HTTP %d) — set remote_token / RAG_REMOTE_TOKEN to the server's admin token", resp.StatusCode)
+	// A proxy's error page first: a Cloudflare WAF block is a 403 too, and
+	// calling it a token problem sends people the wrong way.
+	if msg := ProxyProblem(resp.StatusCode, resp.Header, raw); msg != "" {
+		return fmt.Errorf("server: %s %s: %s", method, path, msg)
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("the server rejected the token (HTTP 401) — set remote_token / RAG_REMOTE_TOKEN to the server's admin token")
 	}
 	if resp.StatusCode >= 300 {
 		var e struct {
@@ -118,6 +124,9 @@ func (p *RemoteProvider) do(ctx context.Context, method, path string, body, out 
 		return fmt.Errorf("server: %s %s: HTTP %d: %s", method, path, resp.StatusCode, msg)
 	}
 	if out != nil && len(raw) > 0 {
+		if msg := NotJSONProblem(resp.Header, raw); msg != "" {
+			return fmt.Errorf("server: %s %s: %s", method, path, msg)
+		}
 		if err := json.Unmarshal(raw, out); err != nil {
 			return fmt.Errorf("server: %s %s: decode: %w", method, path, err)
 		}
