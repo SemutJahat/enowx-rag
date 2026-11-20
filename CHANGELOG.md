@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the server (WAF 403, 413, 52x, a login page) are explained as such, with the
   Ray ID, in `connect`, `push`, client mode and the dashboard, instead of
   "the token was rejected". Clients send `User-Agent: enowx-rag/<version>`.
-- **Dokploy and Cloudflare docs** (README and the in-app Deploy page).
+- **Dokploy and Cloudflare docs** (README and the in-app Deploy page),
+  including auto-deploy on push through Dokploy's webhook.
 - **VPS deployment**: `deploy/install-vps.sh` (Docker, generated secrets,
   optional HTTPS through Caddy, health wait), `docker-compose.vps.yml`
   (PostgreSQL 17 + pgvector, not published; token required),

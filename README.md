@@ -196,6 +196,12 @@ Traefik with HTTPS, so the Caddy profile stays off:
    Only if it lists `dokploy-network` alone (older Dokploy) turn on
    **Advanced → Isolated Deployments**.
 5. **Deploy** and open the domain: the setup wizard asks for the Voyage key.
+6. **Auto-deploy** (optional): turn on **Autodeploy**, then add the service's
+   **Webhook URL** (Deployments tab) to the repository's GitHub webhooks
+   (content type `application/json`, event *push*). Every push to the
+   configured branch then redeploys. If the Dokploy panel's host is behind a
+   Cloudflare IP allowlist, exempt `/api/deploy/` for GitHub's webhook ranges
+   (`hooks` in `https://api.github.com/meta`), or GitHub gets a 403.
 
 Data lives in the named volumes `pg-data` and `enowx-data` and survives
 redeploys. The dashboard is also published on the host's `127.0.0.1:7777`
