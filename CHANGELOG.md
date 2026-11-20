@@ -95,6 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size a store stamps on the points it writes now.
 
 ### Fixed
+- **Client mode kept a local database**: a machine in client mode still opened
+  `~/.enowx-rag/metrics.db`, although the server records metrics. It now keeps
+  them in memory, so a client machine has no database, only
+  `project_dirs.json` and `project_sources.json`.
 - **`push --project X` showed other projects in its plan**: after X the filter
   was lost, so every later project was listed (as "project exists: replace"
   with `--mode replace`) and counted in the re-embed estimate, which could ask

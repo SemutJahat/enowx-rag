@@ -167,6 +167,15 @@ func (cfg *RuntimeConfig) embedModelName() string {
 	return cfg.VoyageModel
 }
 
+// localMetricsPath is the SQLite file for durable metrics, or "" in client
+// mode, where the server records them and the machine keeps no database.
+func localMetricsPath(clientMode bool) string {
+	if clientMode {
+		return ""
+	}
+	return config.MetricsDBPath()
+}
+
 // buildService wraps a provider, optional reranker, and indexer into a
 // core.Service that both MCP and HTTP handlers call.
 func buildService(provider rag.Provider, reranker rag.Reranker, idx *indexer.Indexer) *core.Service {
@@ -331,9 +340,11 @@ func main() {
 
 	// Durable metrics + activity log: a local SQLite file (pure-Go, no cgo)
 	// that works with any vector-store backend. If it can't be opened, fall
-	// back to in-memory metrics rather than failing startup.
-	metricsPath := config.MetricsDBPath()
-	if err := os.MkdirAll(filepath.Dir(metricsPath), 0o700); err == nil {
+	// back to in-memory metrics rather than failing startup. Client mode
+	// keeps them in memory: the server records metrics.
+	if metricsPath := localMetricsPath(clientMode); metricsPath == "" {
+		// no local database on a client machine
+	} else if err := os.MkdirAll(filepath.Dir(metricsPath), 0o700); err == nil {
 		if store, err := core.NewSQLiteMetricsStore(metricsPath); err != nil {
 			fmt.Fprintf(os.Stderr, "metrics: durable store unavailable, using in-memory: %v\n", err)
 		} else {
