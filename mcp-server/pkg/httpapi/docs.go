@@ -220,9 +220,9 @@ Without Docker: run `+"`"+`enowx-rag --serve`+"`"+` under systemd (`+"`"+`deploy
 Dokploy runs `+"`"+`docker-compose.vps.yml`+"`"+` as a Compose service and puts its own Traefik with HTTPS in front, so the Caddy profile stays off.
 
 1. **Create Service → Compose**, provider Git or GitHub: this repository, branch `+"`"+`main`+"`"+`, compose path `+"`"+`./docker-compose.vps.yml`+"`"+`.
-2. **Advanced → Isolated Deployments: on.** Without it only the service that has a domain joins Dokploy's network, and enowx-rag can't resolve `+"`"+`postgres`+"`"+`.
-3. **Environment**: `+"`"+`POSTGRES_PASSWORD`+"`"+` (letters and digits, e.g. `+"`"+`openssl rand -hex 24`+"`"+`), `+"`"+`RAG_ADMIN_TOKEN`+"`"+` (`+"`"+`openssl rand -hex 32`+"`"+`); optionally `+"`"+`RAG_VOYAGE_API_KEY`+"`"+`, `+"`"+`ENOWX_WEB_BUILD=prebuilt`+"`"+` on a small server, and `+"`"+`ENOWX_PORT`+"`"+` when 7777 is taken on the host.
-4. **Domains**: the host name (e.g. `+"`"+`rag.example.com`+"`"+`), service `+"`"+`enowx-rag`+"`"+`, container port `+"`"+`7777`+"`"+`, HTTPS on: Let's Encrypt, or no certificate when Cloudflare connects with an origin certificate already installed in Dokploy.
+2. **Environment**: `+"`"+`POSTGRES_PASSWORD`+"`"+` (letters and digits, e.g. `+"`"+`openssl rand -hex 24`+"`"+`), `+"`"+`RAG_ADMIN_TOKEN`+"`"+` (`+"`"+`openssl rand -hex 32`+"`"+`); optionally `+"`"+`RAG_VOYAGE_API_KEY`+"`"+`, `+"`"+`ENOWX_WEB_BUILD=prebuilt`+"`"+` on a small server, and `+"`"+`ENOWX_PORT`+"`"+` when 7777 is taken on the host. Keep **Create Environment File** on.
+3. **Domains**: the host name (e.g. `+"`"+`rag.example.com`+"`"+`), service `+"`"+`enowx-rag`+"`"+`, container port `+"`"+`7777`+"`"+`, HTTPS on: Let's Encrypt, or certificate provider **None** when Cloudflare connects with an origin certificate already added under Settings → Certificates.
+4. **Preview Compose**: `+"`"+`enowx-rag`+"`"+` should list both `+"`"+`dokploy-network`+"`"+` and `+"`"+`default`+"`"+` under `+"`"+`networks`+"`"+` (Dokploy v0.31 keeps the stack's own network, so it still reaches `+"`"+`postgres`+"`"+`, which stays off Dokploy's shared network). Only if it lists `+"`"+`dokploy-network`+"`"+` alone (older Dokploy) turn on **Advanced → Isolated Deployments**.
 5. **Deploy**, then open the domain: the setup wizard asks for the Voyage key and models.
 
 Data lives in the named volumes `+"`"+`pg-data`+"`"+` and `+"`"+`enowx-data`+"`"+` and survives redeploys. The dashboard is also published on the host's `+"`"+`127.0.0.1:7777`+"`"+` only: not reachable from outside, handy for an SSH tunnel.
