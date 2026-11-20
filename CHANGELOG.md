@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **VPS deployment**: `deploy/install-vps.sh` (Docker, generated secrets,
+  optional HTTPS through Caddy, health wait), `docker-compose.vps.yml`
+  (PostgreSQL 17 + pgvector, not published; token required),
+  `deploy/vps.env.example` and a systemd unit. The Docker image is static
+  (CGO off), runs as a non-root user with `/data` as its volume, has a health
+  check on `/api/health`, and can embed the committed dashboard
+  (`WEB=prebuilt`) on small machines.
+- **Client mode** (`vector_store: remote`, `RAG_REMOTE_URL`,
+  `RAG_REMOTE_TOKEN`): the machine scans and chunks, the server embeds,
+  stores, reranks and records metrics; syncs are reported to the server, so
+  the dashboard shows which machine and folder each project came from.
+  `enowx-rag connect --remote URL --token T` configures every MCP client found
+  (merge + `.bak`; `--client`, `--print`).
+- **Import local memory**: `enowx-rag push` (consistent snapshot, gzip upload
+  with progress, per-project plan, job, folder registration) and the
+  dashboard's **Import** page (`POST /api/import/upload`, `/api/import/start`).
+  Vectors that fit the server's model and dimension are reused (the voyage-4
+  family shares one space); others are re-embedded after a token estimate.
+- **Automatic SQLite → pgvector**: a pgvector server imports a SQLite store
+  found next to its config once at startup and renames it
+  `rag.db.imported-<time>` (`RAG_AUTO_IMPORT_SQLITE=false` turns it off).
+- **Onboarding wizard rebuilt**: Welcome → Database (detected from the
+  environment, versions shown) → Models → Review & apply (real tests of store,
+  embedder and reranker) → Connect → Done. Apply saves `config.yaml` and the
+  server restarts itself in place (same PID; picks up an upgraded binary).
+- **Voyage settings that explain themselves**: model catalog
+  (`GET /api/models`) with dimensions, price, context length and family;
+  live tests (`POST /api/models/test`) that report the returned dimension,
+  latency and tokens, or the error with a hint; Settings warns before saving
+  whether chunks must be re-embedded, how many, and the cost.
+- **Re-index without a path**: `POST /api/projects/{id}/reindex` runs as a
+  job; `auto` re-syncs the known folder when the server can read it and
+  otherwise re-embeds the stored chunks.
+- Background jobs (`GET /api/jobs`), a persisted activity log
+  (`GET /api/activity`: syncs, imports, jobs, restarts), `GET /api/server`,
+  open `GET /api/health`, `GET /api/setup/detect`, JSON errors with a `hint`.
+- `RAG_VOYAGE_BASE_URL` for Voyage-compatible gateways and tests.
+- In-app docs: *Deploy on a VPS* and *Connect machines & import*; links and
+  snippets honor `X-Forwarded-Proto` / `X-Forwarded-Host` behind a proxy.
 - **Auto-sync before search**: a directory indexed once with
   `rag_index_project` is recorded (`~/.enowx-rag/project_dirs.json`) and
   re-synced incrementally before a search when its index is older than
@@ -99,7 +138,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `*secret*` files by name, and any chunk holding a private key block or a
   cloud or API token.
 
+### Removed
+- The Playground, Migration and Setup pages (search tests and moves between
+  stores stay available as `POST /api/search` and `POST /api/migrate`).
+- `POST /api/setup/install-mcp`, `GET /api/setup/clients` and
+  `POST /api/setup/write-agents-md`: they wrote files on the server's machine,
+  which is wrong for a remote server. `enowx-rag connect` writes the client
+  config on the machine that runs it.
+
 ### Changed
+- **pgvector follows the embedding dimension**: after a model or dimension
+  change, the vector column is resized only once a test embedding with the new
+  settings succeeds; a startup job re-embeds the affected chunks and searches
+  skip chunks without a vector meanwhile.
+- **The dashboard is for hosting and monitoring**: Overview (health, store,
+  models, projects with their sync source, jobs, activity), Chunks, Import,
+  Connect, Settings, Docs.
+- Settings set by environment variables are read-only in the dashboard;
+  secrets are never written to `config.yaml`, other env values only when they
+  match.
+- Without a Voyage key the server starts; indexing and search fail with an
+  error that says to set it. The silent fallback to TEI is gone.
+- The default rerank model is `rerank-3` (`off` disables reranking).
+- `CreateProject` emits `project_created` only for new projects; imports emit
+  `project_imported`, machine syncs `sync_reported`.
 - The Go module is `github.com/enowdev/enowx-rag/mcp-server`, as its folder
   says, so `go install …/mcp-server/cmd/mcp-server@latest` and importing its
   packages from another program work.

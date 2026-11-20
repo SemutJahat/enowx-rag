@@ -108,6 +108,12 @@ func (s *Service) refreshEmbeddings(ctx context.Context, project string) (int, e
 }
 
 func (s *Service) reembedStale(ctx context.Context, exp rag.Exporter, project, model string, dim int) (int, error) {
+	return s.reembedStaleProgress(ctx, exp, project, model, dim, nil)
+}
+
+// reembedStaleProgress is reembedStale reporting progress (done, total) after
+// every batch when progress is non-nil.
+func (s *Service) reembedStaleProgress(ctx context.Context, exp rag.Exporter, project, model string, dim int, progress func(done, total int)) (int, error) {
 	docs, err := exp.ExportPoints(ctx, project)
 	if err != nil {
 		return 0, fmt.Errorf("check embeddings of %s: %w", project, err)
@@ -128,6 +134,9 @@ func (s *Service) reembedStale(ctx context.Context, exp rag.Exporter, project, m
 		stale = embeddedElsewhere(docs, model, dim)
 	}
 	done := 0
+	if progress != nil {
+		progress(0, len(stale))
+	}
 	for start := 0; start < len(stale); start += reembedBatch {
 		batch := stale[start:min(start+reembedBatch, len(stale))]
 		if err := s.provider.Index(ctx, project, batch); err != nil {
@@ -136,6 +145,9 @@ func (s *Service) reembedStale(ctx context.Context, exp rag.Exporter, project, m
 				"needs a Migration to a new collection or table", len(stale)-done, project, model, dim, err)
 		}
 		done += len(batch)
+		if progress != nil {
+			progress(done, len(stale))
+		}
 	}
 	return done, nil
 }
@@ -148,7 +160,8 @@ func embeddedElsewhere(docs []rag.Document, model string, dim int) []rag.Documen
 	var out []rag.Document
 	for _, d := range docs {
 		m, sz := d.Meta["embed_model"], d.Meta["embed_dim"]
-		if (m != "" && m != model) || (sz != "" && dim > 0 && sz != want) {
+		// Voyage 4 series models share one embedding space: their vectors stay.
+		if (m != "" && !rag.EmbedModelsCompatible(m, model)) || (sz != "" && dim > 0 && sz != want) {
 			out = append(out, d)
 		}
 	}

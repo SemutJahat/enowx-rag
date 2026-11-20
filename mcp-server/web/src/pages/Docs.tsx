@@ -86,11 +86,11 @@ export function Docs() {
 
   const docsURL = `${window.location.origin}/api/docs/setup`
   const agentPrompt =
-    `Set up enowx-rag (per-project RAG memory) for this project. ` +
-    `First read the setup instructions at ${docsURL} and follow them exactly: ` +
-    `probe what's already installed, then install only the missing pieces ` +
-    `(MCP server for my client, the skill, and the AGENTS.md block). ` +
-    `Use my client id (e.g. claude-code) and this project's absolute directory. Skip anything already set up.`
+    `Set up enowx-rag (per-project RAG memory) for this project, using the enowx-rag server at ${window.location.origin}. ` +
+    `First read the setup instructions at ${docsURL} (send the header "Authorization: Bearer <admin token>"; ask me for the token) ` +
+    `and follow them: install the enowx-rag binary if it's missing, connect my MCP client to the server in client mode, ` +
+    `add the enowx-rag block to AGENTS.md, then index this project. ` +
+    `Use my client id (e.g. claude-code) and this project's absolute directory. Skip anything already set up, and never write the token into the project.`
 
   const copyPrompt = () => {
     navigator.clipboard.writeText(agentPrompt).then(() => {

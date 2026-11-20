@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -22,8 +24,10 @@ type VoyageEmbeddingClient struct {
 	Model   string
 	Dim     int // 0 = default 1024
 	client  *http.Client
-	baseURL string // override for testing; defaults to voyageAPIURL
+	baseURL string       // override for testing; defaults to voyageAPIURL
 	tokens  atomic.Int64 // cumulative total_tokens reported by the API
+	// fixedDim: the model has one output size, so output_dimension is not sent.
+	fixedDim bool
 }
 
 // NewVoyageEmbeddingClient creates a Voyage AI embedding client.
@@ -35,13 +39,36 @@ func NewVoyageEmbeddingClient(apiKey, model string, dim int) *VoyageEmbeddingCli
 	}
 	if dim == 0 {
 		dim = 1024
+		if info, ok := LookupVoyageModel(model); ok {
+			dim = info.DefaultDim
+		}
+	}
+	fixed := false
+	if info, ok := LookupVoyageModel(model); ok {
+		// Fixed-size models (voyage-3, voyage-law-2, …) reject output_dimension:
+		// they always return their own size, which is what gets stored.
+		if d, ok := info.FixedDim(); ok {
+			dim, fixed = d, true
+		}
 	}
 	return &VoyageEmbeddingClient{
-		APIKey: apiKey,
-		Model:  model,
-		Dim:    dim,
-		client: &http.Client{Timeout: 120 * time.Second},
+		APIKey:   apiKey,
+		Model:    model,
+		Dim:      dim,
+		fixedDim: fixed,
+		baseURL:  voyageEndpoint("embeddings"),
+		client:   &http.Client{Timeout: 120 * time.Second},
 	}
+}
+
+// voyageEndpoint is the URL of a Voyage API endpoint ("embeddings",
+// "rerank"): RAG_VOYAGE_BASE_URL (e.g. a Voyage-compatible gateway,
+// "https://gw.example.com/v1") when set, else "" for the official API.
+func voyageEndpoint(name string) string {
+	if base := strings.TrimRight(os.Getenv("RAG_VOYAGE_BASE_URL"), "/"); base != "" {
+		return base + "/" + name
+	}
+	return ""
 }
 
 type voyageRequest struct {
@@ -99,26 +126,25 @@ func (c *VoyageEmbeddingClient) embedWithType(ctx context.Context, texts []strin
 }
 
 func (c *VoyageEmbeddingClient) embedBatch(ctx context.Context, texts []string, inputType string) ([][]float32, error) {
-	body, _ := json.Marshal(voyageRequest{
-		Input:           texts,
-		Model:           c.Model,
-		InputType:       inputType,
-		OutputDimension: c.Dim,
-	})
+	req := voyageRequest{Input: texts, Model: c.Model, InputType: inputType}
+	if !c.fixedDim {
+		req.OutputDimension = c.Dim
+	}
+	body, _ := json.Marshal(req)
 
 	url := c.baseURL
 	if url == "" {
 		url = voyageAPIURL
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Authorization", "Bearer "+c.APIKey)
 
-	resp, err := c.client.Do(req)
+	resp, err := c.client.Do(hreq)
 	if err != nil {
 		return nil, fmt.Errorf("voyage request failed: %w", err)
 	}
@@ -126,7 +152,7 @@ func (c *VoyageEmbeddingClient) embedBatch(ctx context.Context, texts []string, 
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("voyage returned %d: %s", resp.StatusCode, string(b))
+		return nil, voyageError("embeddings", c.Model, resp.StatusCode, b)
 	}
 
 	var result voyageResponse

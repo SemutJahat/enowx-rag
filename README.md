@@ -8,33 +8,19 @@ Per-project RAG memory MCP server. Each project gets its own vector collection, 
 
 ![enowx-rag dashboard — Overview](docs/screenshots/overview.png)
 
-The server runs in **two modes** from a single binary:
+One binary, three ways to run it:
 
-- **MCP stdio mode** (default): `enowx-rag` — talks to AI coding tools over stdio via the Model Context Protocol.
-- **HTTP serve mode**: `enowx-rag --serve` — starts an HTTP server with a REST API, SSE event stream, an embedded React dashboard, **and MCP over HTTP at `/mcp`** so agents can connect to enowx-rag as a remote daemon (e.g. on a VPS).
+- **Local** (default): `enowx-rag` — your MCP client launches it over stdio; everything stays on this machine.
+- **Server**: `enowx-rag --serve` — a dashboard for monitoring, a REST API, and **MCP over HTTP at `/mcp`**. It embeds (Voyage), stores (PostgreSQL + pgvector), reranks and records metrics, e.g. on a VPS.
+- **Client**: `enowx-rag connect --remote https://rag.example.com --token …` — your machine reads and chunks the code, the server embeds and stores it. Existing local memory moves over with `enowx-rag push`.
 
-### Remote daemon (MCP over HTTP)
-
-Run `enowx-rag --serve` on a host and connect agents remotely. Set `RAG_ADMIN_TOKEN` to secure it — it gates both `/api/*` and `/mcp` with a bearer token (unset = no auth, only for trusted networks). Put a TLS reverse proxy in front for public use.
+### Run it on a VPS
 
 ```bash
-RAG_ADMIN_TOKEN=$(openssl rand -hex 32) ./enowx-rag --serve --addr :7777
+curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/deploy/install-vps.sh | sudo sh
 ```
 
-Point an MCP client at the daemon:
-
-```json
-{
-  "mcpServers": {
-    "enowx-rag": {
-      "url": "https://rag.example.com/mcp",
-      "headers": { "Authorization": "Bearer <RAG_ADMIN_TOKEN>" }
-    }
-  }
-}
-```
-
-All MCP tools work identically to local stdio mode. See the **Docs → Remote / daemon** page for details.
+Docker, PostgreSQL + pgvector, the server and optional HTTPS, with generated secrets; the dashboard's setup wizard then only asks for the Voyage models. See [Deploy on a VPS](#deploy-on-a-vps-postgresql--pgvector).
 
 ---
 
@@ -49,19 +35,18 @@ without you re-explaining them every time.
   (`project_<id>`), so an agent working in one repo never retrieves context
   leaked from another. Index a codebase once; query it in isolation.
 - **Retrieval that actually finds things.** Dense semantic search, optional
-  **hybrid** (dense + lexical RRF), **reranking** (Voyage `rerank-2.5`), and
-  near-duplicate **compression** — tunable per query. See the ranked results,
-  scores, and matched snippets live in the Playground.
+  **hybrid** (dense + lexical RRF), **reranking** (Voyage `rerank-3`), and
+  near-duplicate **compression** — tunable per query.
 - **Persistent memory, durable metrics.** Design decisions and facts survive
   across sessions and restarts; query latency (p50/p95), token usage, and
   retrieval breakdown are persisted to a local SQLite DB (pure-Go, no cgo).
 - **Bring your own stack.** Vector stores: **a built-in SQLite file** (nothing to install), **Qdrant, pgvector, Chroma**.
   Embedders: **Voyage AI, any OpenAI-compatible `/v1/embeddings` API, or
-  self-hosted TEI**. Swap models or move stores later with the built-in
-  **Migration** tool (re-embeds stored text — no re-scraping your codebase).
-- **One binary, two modes.** Local **MCP stdio** for your editor, or
-  `--serve` for a **remote daemon** (REST API + dashboard + MCP over HTTP),
-  gated by a bearer token — run it centrally on a VPS for a whole team.
+  self-hosted TEI**. Change the model in Settings and the chunks are
+  re-embedded from their stored text — no re-scraping your codebase.
+- **Local or hosted.** Local **MCP stdio** for your editor, or one server on a
+  VPS (PostgreSQL + pgvector, bearer token, HTTPS) shared by all your machines
+  in client mode, with a dashboard to watch it.
 - **No lock-in, no toolchain.** A single self-contained binary with the
   dashboard embedded. Install via `curl | sh`, Homebrew, npm, `go install`, or
   a direct download. CGO-free, so it runs anywhere.
@@ -70,13 +55,17 @@ without you re-explaining them every time.
 
 The embedded dashboard (`enowx-rag --serve`) — real data from a live instance:
 
-| Overview | Retrieval Playground |
+| Overview | Chunks |
 |---|---|
-| [![Overview](docs/screenshots/overview.png)](docs/screenshots/overview.png) | [![Playground](docs/screenshots/playground.png)](docs/screenshots/playground.png) |
-| **Chunks** | **Migration** |
-| [![Chunks](docs/screenshots/chunks.png)](docs/screenshots/chunks.png) | [![Migration](docs/screenshots/migration.png)](docs/screenshots/migration.png) |
+| [![Overview](docs/screenshots/overview.png)](docs/screenshots/overview.png) | [![Chunks](docs/screenshots/chunks.png)](docs/screenshots/chunks.png) |
 | **Docs** | **Settings** |
 | [![Docs](docs/screenshots/docs.png)](docs/screenshots/docs.png) | [![Settings](docs/screenshots/settings.png)](docs/screenshots/settings.png) |
+
+The dashboard is for hosting and monitoring: **Overview** (health, store,
+models, projects and where each was last synced from, jobs, live activity),
+**Chunks**, **Import** (bring a local `rag.db`), **Connect** (commands for your
+machines), **Settings** (Voyage embed/rerank models with live tests and re-embed
+cost, database, auto-sync, token) and **Docs**.
 
 ---
 
@@ -150,6 +139,99 @@ The enowx-rag container serves both the API and UI on port 7777. Qdrant starts a
 
 ---
 
+## Deploy on a VPS (PostgreSQL + pgvector)
+
+### One command
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/deploy/install-vps.sh | sudo sh
+# or without questions:
+curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/deploy/install-vps.sh \
+  | sudo ENOWX_DOMAIN=rag.example.com VOYAGE_API_KEY=pa-... sh
+```
+
+[`deploy/install-vps.sh`](deploy/install-vps.sh):
+
+1. installs Docker if it's missing and clones the repo into `/opt/enowx-rag`;
+2. writes `/opt/enowx-rag/.env` (mode 600) with a random PostgreSQL password and admin token;
+3. starts [`docker-compose.vps.yml`](docker-compose.vps.yml): **postgres** (`pgvector/pgvector:pg17`, not published), **enowx-rag**, and with `ENOWX_DOMAIN` set **caddy** for HTTPS (Let's Encrypt);
+4. waits for `/api/health` and prints the dashboard URL, the token, and the commands for your machines.
+
+Re-run it to update (`.env` is kept). On a VPS with less than 2 GB of RAM it
+embeds the committed dashboard instead of building it with npm
+(`ENOWX_WEB_BUILD=prebuilt`).
+
+By hand:
+
+```bash
+git clone https://github.com/enowdev/enowx-rag && cd enowx-rag
+cp deploy/vps.env.example .env      # set POSTGRES_PASSWORD and RAG_ADMIN_TOKEN
+docker compose -f docker-compose.vps.yml up -d --build
+docker compose -f docker-compose.vps.yml --profile https up -d --build   # HTTPS (ENOWX_DOMAIN)
+```
+
+Without Docker, run the binary under systemd:
+[`deploy/enowx-rag.service`](deploy/enowx-rag.service) (pgvector DSN and token in
+`/etc/enowx-rag.env`, your own HTTPS proxy in front).
+
+### Onboarding
+
+Open the dashboard and sign in with the admin token. The setup wizard:
+
+1. **Database** — detected from the environment (PostgreSQL and pgvector versions shown); nothing to type.
+2. **Models** — Voyage embedding model and dimension, rerank model: price, context length, and a live test of your key (dimension returned, latency, tokens — or the error with a hint).
+3. **Review & apply** — each component is tested for real; the server writes `config.yaml` and restarts itself.
+4. **Connect** — the commands for your machines.
+
+Settings given in `.env` are read-only in the dashboard and secrets are never
+written to `config.yaml`.
+
+### Connect your machines (client mode)
+
+On every machine where you code:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/install.sh | sh
+enowx-rag connect --remote https://rag.example.com --token <RAG_ADMIN_TOKEN>
+```
+
+`connect` checks the URL and token, then adds enowx-rag to every MCP client it
+finds (Claude Code, Cursor, Claude Desktop, Cline, Windsurf, Codex, Zed,
+Continue; `--client` picks, `--print` only prints), merging into existing
+configs with a `.bak` copy. The entry runs the local binary with
+`RAG_VECTOR_STORE=remote`, `RAG_REMOTE_URL` and `RAG_REMOTE_TOKEN`: the machine
+reads and chunks files (honoring `.gitignore`, never sending secrets), the
+server embeds, stores, reranks and records metrics. No Voyage key or database on
+the machine.
+
+### Bring existing memory (SQLite → pgvector)
+
+```bash
+enowx-rag push --remote https://rag.example.com --token <RAG_ADMIN_TOKEN>
+```
+
+`push` snapshots `~/.enowx-rag/rag.db` (safe while agents use it), uploads it
+gzip-compressed, shows per project how many chunks keep their vectors, imports
+them as a server job and registers each project's folder so auto-sync carries
+on. Vectors from the server's model and dimension are copied as they are (the
+voyage-4 family shares one embedding space, so those are reused across its
+models); the rest are re-embedded from text, after showing the token estimate
+(`--yes` skips the question). Options: `--project ID` (repeatable),
+`--mode replace`, `--file other.db`. The dashboard's **Import** page does the
+same from the browser.
+
+A server configured for pgvector that finds a SQLite store next to its config
+imports it on start and renames it `rag.db.imported-<time>`
+(`RAG_AUTO_IMPORT_SQLITE=false` turns that off).
+
+### Security
+
+- The admin token reads and deletes every project: keep it secret.
+- Use HTTPS (`ENOWX_DOMAIN`) on the internet; over plain HTTP the token is sent in clear text.
+- Docker publishes ports past ufw/firewalld; without the HTTPS profile, restrict the port at your provider's firewall.
+
+---
+
 ## Two modes of operation
 
 ### MCP stdio mode (default)
@@ -190,33 +272,47 @@ When running in `--serve` mode, the following REST endpoints are available:
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
-| `GET` | `/api/projects` | List all projects with chunk counts |
+| `GET` | `/api/health` | Liveness, version, boot id (always open) |
+| `GET` | `/api/server` | Store, embedder, reranker, auto-sync, stale chunks, running jobs |
+| `GET` | `/api/models` | Voyage embedding and rerank catalog (dimensions, price, context) |
+| `POST` | `/api/models/test` | Test a Voyage model or reranker with a key 🔒 |
+| `POST` | `/api/server/restart` | Restart in place (re-reads config.yaml) 🔒 |
+| `GET` | `/api/projects` | List all projects with chunk counts and last sync source |
 | `GET` | `/api/projects/{id}` | Get project detail (404 if not found) |
-| `GET` | `/api/projects/{id}/points` | List chunks (supports `?source_file=`, `?offset=`, `?limit=`) |
-| `DELETE` | `/api/projects/{id}/points/{pointId}` | Delete a single chunk |
-| `POST` | `/api/projects/{id}/reindex` | Re-index a project directory (body: `{"directory": "/path"}`) |
+| `POST` | `/api/projects/{id}` | Create a project |
 | `DELETE` | `/api/projects/{id}` | Delete a project collection |
+| `GET` | `/api/projects/{id}/points` | List chunks (supports `?source_file=`, `?offset=`, `?limit=`) |
+| `POST` | `/api/projects/{id}/points/delete` | Delete chunks (`{"ids": [...]}`) |
+| `DELETE` | `/api/projects/{id}/points/{pointId}` | Delete a single chunk |
+| `POST` | `/api/projects/{id}/reindex` | Re-index as a job, no path needed (`{"mode": "auto"\|"files"\|"reembed", "directory"?}`) |
+| `POST` | `/api/projects/{id}/documents` | Index documents (client mode, scripts) |
+| `POST` | `/api/projects/{id}/sources` | A machine reports a sync (client mode) |
 | `POST` | `/api/search` | Search (body: `{"project_id", "query", "k", "recall", "hybrid", "rerank", "compress"}`) |
 | `GET` | `/api/stats` | Aggregate stats (total projects, chunks, embed model) |
 | `GET` | `/api/metrics` | Query metrics: latency (avg/p50/p95), token usage, backend, `persistent` flag |
-| `GET` | `/api/events` | SSE stream of realtime events (index, search, etc.) |
-| `POST` | `/api/setup/test` | Test connectivity (localhost or admin token required) |
-| `POST` | `/api/setup/apply` | Save config to `~/.enowx-rag/config.yaml` (localhost or admin token required) |
-| `GET` | `/api/setup/status` | Check if config exists |
-| `POST` | `/api/setup/install-mcp` | Install the MCP server into a client's config (merge + backup) |
-| `GET` | `/api/setup/probe` | Report what's installed (MCP per client, skill, AGENTS.md block) for idempotent setup |
-| `POST` | `/api/setup/write-agents-md` | Merge the enowx-rag block into a project's AGENTS.md (localhost/admin token) |
-| `POST` | `/api/migrate` | Migrate/re-embed a project into a new destination (async, SSE progress) |
-| `GET` | `/api/docs/setup` | Markdown setup instructions for an AI agent to follow |
+| `GET` | `/api/activity` | Recent events (syncs, imports, jobs, restarts), persisted |
+| `GET` | `/api/events` | SSE stream of the same events, live |
+| `GET` | `/api/jobs`, `/api/jobs/{id}` | Background jobs (re-index, import, startup) |
+| `POST` | `/api/import/upload` | Upload a SQLite store (raw or gzip); returns the import plan and cost |
+| `POST` | `/api/import/start` | Start the import (`{"upload_id", "projects"?, "mode"?: "merge"\|"replace"}`) |
+| `GET` | `/api/setup/status` | Configured? Missing settings, env-locked keys (always open) |
+| `GET` | `/api/setup/detect` | What the server finds on its own (database, key, old SQLite store) 🔒 |
+| `POST` | `/api/setup/test` | Test store, embedder and reranker 🔒 |
+| `POST` | `/api/setup/apply` | Save `config.yaml`, optionally restart 🔒 |
+| `GET` / `POST` | `/api/setup/config` | Current config (secrets masked) / change settings with re-embed warnings 🔒 |
+| `GET` | `/api/setup/mcp-snippet` | Config to paste into an MCP client (`?client_id=&mode=client\|remote`) |
+| `POST` | `/api/migrate` | Move/re-embed a project into another store (API only) 🔒 |
+| `GET` | `/api/docs`, `/api/docs/{section}` | The documentation shown in the dashboard, as markdown |
 
-Non-API routes serve the embedded React SPA (client-side routing for `/playground`, `/chunks`, `/migration`, `/setup`, etc.).
+With an admin token set, every endpoint except `/api/health` and
+`/api/setup/status` needs `Authorization: Bearer <token>`. 🔒 endpoints also
+need it when no token is set, unless called from localhost. Errors are JSON
+`{"error", "hint"?}`.
 
-**Agent-driven setup.** Paste a short prompt into your AI coding agent telling it
-to read `GET /api/docs/setup` and follow it. The agent probes what's already in
-place (`GET /api/setup/probe`) and installs only the missing pieces — the MCP
-server (`POST /api/setup/install-mcp`), the skill, and the project's AGENTS.md
-block (`POST /api/setup/write-agents-md`, merged idempotently). The Install step
-of the wizard shows the copy-paste prompt.
+**Agent-driven setup.** The dashboard's Docs → Agent setup page has a prompt to
+paste into your coding agent: it reads `GET /api/docs/setup` and installs the
+binary, runs `enowx-rag connect`, adds the AGENTS.md block and indexes the
+project, skipping what's already there.
 
 **Query metrics** are recorded for every search and exposed at `/api/metrics`:
 latency percentiles, Voyage token usage (embed + rerank), and — for hybrid
@@ -255,7 +351,7 @@ When `RAG_ADMIN_TOKEN` is **not set**, no authentication is required (default be
 
 ## Docker all-in-one
 
-The `docker-compose.all-in-one.yml` file at the repository root starts the enowx-rag server (API + UI) alongside Qdrant in a single command:
+For a server, prefer [`docker-compose.vps.yml`](#deploy-on-a-vps-postgresql--pgvector) (PostgreSQL + pgvector, required token, optional HTTPS). The `docker-compose.all-in-one.yml` file starts the enowx-rag server (API + UI) alongside Qdrant in a single command:
 
 ```bash
 export RAG_VOYAGE_API_KEY=your-voyage-api-key
@@ -266,6 +362,7 @@ docker compose -f docker-compose.all-in-one.yml up -d
 - Qdrant starts automatically on port 6333
 - PostgreSQL (pgvector) and TEI are available as commented-out services in the compose file
 - Set `RAG_ADMIN_TOKEN` in the compose environment to enable auth
+- Settings saved in the dashboard persist in the `enowx-data` volume
 
 To use pgvector instead of Qdrant, uncomment the `postgres` service and switch `RAG_VECTOR_STORE` to `pgvector` in the compose file.
 
@@ -720,8 +817,11 @@ enowx-rag/
 ├── README.md                          # This file
 ├── Makefile                           # Build pipeline: make web, make build, make dev-*
 ├── docker-compose.all-in-one.yml      # All-in-one: enowx-rag + Qdrant (optional PG, TEI)
+├── docker-compose.vps.yml             # VPS: enowx-rag + PostgreSQL/pgvector (+ Caddy HTTPS)
+├── deploy/                            # install-vps.sh, vps.env.example, systemd unit
 ├── mcp-server/                        # Go server (MCP stdio + HTTP serve modes)
-│   ├── cmd/mcp-server/main.go         # Entry point: --serve / --addr flags
+│   ├── cmd/mcp-server/main.go         # Entry point: stdio, --serve, startup jobs, restart
+│   ├── cmd/mcp-server/client_cmds.go  # connect / push subcommands (client mode)
 │   ├── pkg/rag                        # Provider interface + Qdrant, Chroma, pgvector, Voyage, TEI
 │   ├── pkg/core                       # Service layer (shared by MCP + HTTP)
 │   ├── pkg/config                     # Config file (~/.enowx-rag/config.yaml)
@@ -730,7 +830,7 @@ enowx-rag/
 │   ├── web/                           # React SPA (Vite + React + TypeScript + Tailwind)
 │   │   ├── dist/                      # Build output (embedded via go:embed)
 │   │   └── embed.go                   # //go:embed all:dist
-│   ├── Dockerfile                     # Multi-stage: builds SPA + Go binary
+│   ├── Dockerfile                     # Multi-stage: SPA (or prebuilt) + static Go binary, non-root
 │   └── docker-compose.yml             # Backend-only compose (Qdrant + TEI)
 └── skill/                             # Factory Droid skill
     ├── enowx-rag.md
@@ -767,35 +867,22 @@ enowx-rag/
 
 ## Migration
 
-The dashboard's **Migration** page (and `POST /api/migrate`) re-embeds a
-project's stored text into a new destination. Because embedding vectors are
-model-specific and not portable, migration re-embeds from text (which enowx-rag
-stores alongside every chunk) rather than copying raw vectors. Use it to:
+**Local memory to a server:** `enowx-rag push` or the dashboard's **Import**
+page (see [Deploy on a VPS](#deploy-on-a-vps-postgresql--pgvector)).
 
-- **Change embedding model or dimension** — pick a new embedder/model/dim; the
-  destination collection is re-embedded from the source text.
-  (For pgvector, a new dimension requires a **new table name** — all projects in
-  one pgvector table share a fixed vector dimension.)
-- **Move between vector stores** — e.g. Qdrant → pgvector, or into the built-in
-  SQLite store (`sqlite_path` optional; empty means the running store's file,
-  where the destination project needs a new name).
-- **Import from an external cloud vector DB** — **Qdrant Cloud** is verified;
-  **Pinecone**, **Weaviate**, and **Chroma Cloud** connectors are *experimental*
-  (built from vendor docs, mock-tested only — not verified against a live
-  account) and are labelled as such in the UI.
+**Changing the model or dimension of the store you run on needs no migration.**
+Change it in **Settings** (or `config.yaml`) and restart. Settings tells you
+first whether chunks must be re-embedded (none within the voyage-4 family at
+the same dimension), how many, and the estimated tokens and cost. After the
+restart a background job re-embeds them from their stored text; pgvector
+resizes its vector column first, only after a test embedding with the new
+settings succeeded, and searches skip chunks that aren't re-embedded yet.
 
-Migrations run asynchronously with live progress over SSE. The source project is
-never removed automatically; after a successful migration the UI offers an
-explicit "Delete source" action.
-
-**Changing the model of the store you run on needs no migration.** Edit the
-model or dimension in `~/.enowx-rag/config.yaml` and restart every session that
-runs enowx-rag. The first search or sync of each project then re-embeds, from
-their stored text, the points another model or size wrote — code chunks and
-memory notes alike — once (`points_reembedded` in the `rag_index_project`
-result). The built-in SQLite store takes the new vectors in place; a Qdrant
-collection or pgvector table has a fixed vector size, so a new *dimension*
-there still needs a migration to a new collection or table.
+**Between stores** (API only): `POST /api/migrate` re-embeds a project's stored
+text into another store with credentials you pass — e.g. Qdrant → pgvector, or
+an import from **Qdrant Cloud** (verified); **Pinecone**, **Weaviate** and
+**Chroma Cloud** connectors are *experimental* (mock-tested only). It runs as a
+job with progress events and never deletes the source.
 
 ## Embedding options
 
@@ -863,22 +950,27 @@ All configuration is via environment variables (or config file at `~/.enowx-rag/
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `RAG_VECTOR_STORE` | `qdrant` | Vector store: `qdrant`, `chroma`, or `pgvector` |
-| `RAG_EMBEDDER` | `voyage` | Embedding provider: `voyage`, `openai` (any OpenAI-compatible API), or `tei` (auto-detects: falls back to `tei` if `RAG_VOYAGE_API_KEY` is not set) |
+| `RAG_VECTOR_STORE` | `qdrant` | Vector store: `pgvector`, `sqlite` (built-in), `qdrant`, `chroma`, or `remote` (client mode). A server with no configuration and no Qdrant starts on `sqlite` so the setup wizard can run |
+| `RAG_EMBEDDER` | `voyage` | Embedding provider: `voyage`, `openai` (any OpenAI-compatible API), or `tei`. Without a Voyage key the server still starts; indexing and search answer with an error saying to set it (no silent fallback to TEI) |
 | `RAG_QDRANT_URL` | `http://localhost:6333` | Qdrant REST URL |
 | `RAG_QDRANT_API_KEY` | *(empty)* | Optional Qdrant API key (for Qdrant Cloud) |
 | `RAG_CHROMA_URL` | `http://localhost:8000` | Chroma REST URL |
 | `RAG_PGVECTOR_DSN` | *(empty)* | PostgreSQL connection string (e.g., `postgresql://user@localhost:5432/dbname`). Required when `RAG_VECTOR_STORE=pgvector` |
+| `RAG_SQLITE_PATH` | `~/.enowx-rag/rag.db` | File of the built-in SQLite store |
+| `RAG_REMOTE_URL` | *(empty)* | Client mode: URL of the enowx-rag server (`RAG_VECTOR_STORE=remote`) |
+| `RAG_REMOTE_TOKEN` | *(empty)* | Client mode: the server's admin token |
+| `RAG_AUTO_IMPORT_SQLITE` | `true` | A pgvector server imports a SQLite store found next to its config once at startup, then renames the file |
 | `RAG_TEI_URL` | `http://localhost:8081` | Text Embeddings Inference URL. Used when `RAG_EMBEDDER=tei` |
 | `RAG_VOYAGE_API_KEY` | *(empty)* | Voyage AI API key (required when `RAG_EMBEDDER=voyage`). Get a free key at [voyageai.com](https://voyageai.com) (200M free tokens with voyage-4) |
-| `RAG_VOYAGE_MODEL` | `voyage-4` | Voyage AI embedding model name |
+| `RAG_VOYAGE_MODEL` | `voyage-4` | Voyage AI embedding model name (catalog with prices in Settings or `GET /api/models`) |
+| `RAG_VOYAGE_BASE_URL` | `https://api.voyageai.com/v1` | Voyage-compatible API base (gateways, tests) |
 | `RAG_OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible embeddings base URL (used when `RAG_EMBEDDER=openai`). Point at OpenAI, Together, Jina, a local Ollama (`http://localhost:11434/v1`), etc. |
 | `RAG_OPENAI_API_KEY` | *(empty)* | API key for the OpenAI-compatible endpoint. Leave empty for local/no-auth endpoints |
 | `RAG_OPENAI_MODEL` | *(empty)* | Embedding model name (required when `RAG_EMBEDDER=openai`), e.g. `text-embedding-3-small`, `nomic-embed-text` |
 | `RAG_OPENAI_DIM` | `0` | Output dimension for the OpenAI embedder. `0` = auto-detect; models like `text-embedding-3-*` honor an explicit value |
-| `RAG_VECTOR_DIM` | `1024` | Embedding vector dimension (matches voyage-4 default). Override only if using a different model with a different dimension |
-| `RAG_RERANKER_MODEL` | *(empty)* | Reranker model name (e.g., `rerank-2.5`). When set and `RAG_VOYAGE_API_KEY` is available, reranking is enabled for search |
-| `RAG_ADMIN_TOKEN` | *(empty)* | Optional admin token. When set, all `/api/*` endpoints require `Authorization: Bearer <token>` header. When unset, no auth is required |
+| `RAG_VECTOR_DIM` | `1024` | Voyage embedding dimension: 256, 512, 1024 or 2048 (voyage-4 family, voyage-code-3/4) |
+| `RAG_RERANKER_MODEL` | `rerank-3` | Voyage rerank model (`rerank-3`, `rerank-3-lite`, …); `off` disables reranking. Needs the Voyage key |
+| `RAG_ADMIN_TOKEN` | *(empty)* | Admin token. When set, the dashboard, `/api/*` (except `/api/health`, `/api/setup/status`) and `/mcp` require `Authorization: Bearer <token>`. Required by `docker-compose.vps.yml` |
 | `RAG_AUTO_SYNC_INTERVAL` | `60s` | Directories indexed with `rag_index_project` are re-synced (incrementally) before a search once their index is older than this. A duration (`90s`, `5m`), a number of seconds, or `off` to disable; a tiny value like `1s` syncs before practically every search. Also settable as `auto_sync_interval` in `~/.enowx-rag/config.yaml` (the env var wins). The directories are recorded in `~/.enowx-rag/project_dirs.json` |
 | `RAG_CORS_ORIGIN` | *(empty)* | Optional CORS origin for the SSE event stream (`/api/events`). When set (e.g. `*` or `https://app.example.com`), it becomes the `Access-Control-Allow-Origin` header. When unset, no CORS header is sent and the stream stays same-origin only |
 
@@ -893,7 +985,8 @@ All configuration is via environment variables (or config file at `~/.enowx-rag/
 
 ## Notes
 
-- The server has two modes: **MCP stdio** (default, no flags) and **HTTP serve** (`--serve`). Both use the same core service layer.
+- One binary: **MCP stdio** (default, no flags), **HTTP serve** (`--serve`), and **client mode** (stdio with `RAG_VECTOR_STORE=remote`). All use the same core service layer.
+- The dashboard's restart (after saving settings) re-executes the binary in place (same PID); on Windows restart the process yourself.
 - In stdio mode, logs go to stderr (stdout is the MCP protocol stream).
 - In serve mode, the HTTP server provides a REST API, SSE event stream, and an embedded React dashboard UI.
 - `make build` produces a single self-contained binary with the SPA embedded via `embed.FS`.

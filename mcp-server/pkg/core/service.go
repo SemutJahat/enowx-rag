@@ -38,7 +38,7 @@ type ProjectStat struct {
 
 // Event is a single SSE event published by the EventBus.
 type Event struct {
-	Type      string    `json:"type"`              // e.g. "index_started", "query_executed"
+	Type      string    `json:"type"` // e.g. "index_started", "query_executed"
 	Timestamp time.Time `json:"timestamp"`
 	Data      any       `json:"data,omitempty"`
 }
@@ -48,6 +48,15 @@ type Event struct {
 type EventBus struct {
 	mu          sync.Mutex
 	subscribers map[chan Event]struct{}
+	sink        func(Event) // optional: persists events (see SetSink)
+}
+
+// SetSink registers fn to receive every published event (after
+// subscribers), e.g. to persist the activity log. nil removes it.
+func (b *EventBus) SetSink(fn func(Event)) {
+	b.mu.Lock()
+	b.sink = fn
+	b.mu.Unlock()
 }
 
 // NewEventBus creates a new EventBus.
@@ -85,10 +94,14 @@ func (b *EventBus) Publish(ev Event) {
 	for ch := range b.subscribers {
 		subs = append(subs, ch)
 	}
+	sink := b.sink
 	b.mu.Unlock()
 
 	if ev.Timestamp.IsZero() {
 		ev.Timestamp = time.Now()
+	}
+	if sink != nil {
+		sink(ev)
 	}
 	for _, ch := range subs {
 		select {
@@ -101,16 +114,18 @@ func (b *EventBus) Publish(ev Event) {
 // Service wraps a provider, an optional reranker, and an indexer behind a
 // single API used by both the MCP stdio handlers and the HTTP API layer.
 type Service struct {
-	provider   rag.Provider
-	reranker   rag.Reranker // may be nil
-	indexer    *indexer.Indexer
-	events     *EventBus
-	embedModel string // optional: set by main.go for stats endpoint
+	provider     rag.Provider
+	reranker     rag.Reranker // may be nil
+	indexer      *indexer.Indexer
+	events       *EventBus
+	embedModel   string // optional: set by main.go for stats endpoint
 	metrics      *Metrics
-	metricsStore MetricsStore // optional durable metrics; nil = in-memory only
-	backend      string       // vector store name (e.g. "qdrant"), set by main.go
-	syncer       *autoSync    // optional: keeps indexed directories in sync (EnableAutoSync)
-	embedChecks  embedChecks  // projects found current for the embedder (refreshEmbeddings)
+	metricsStore MetricsStore    // optional durable metrics; nil = in-memory only
+	backend      string          // vector store name (e.g. "qdrant"), set by main.go
+	syncer       *autoSync       // optional: keeps indexed directories in sync (EnableAutoSync)
+	embedChecks  embedChecks     // projects found current for the embedder (refreshEmbeddings)
+	eventStore   EventStore      // optional: persisted activity log (SetEventStore)
+	sources      *SourceRegistry // optional: where each project's code lives (SetSourceRegistry)
 }
 
 // MetricsStore is an optional durable sink for query metrics, injected into
@@ -289,6 +304,11 @@ func (s *Service) Search(ctx context.Context, projectID, query string, opts Sear
 		recall = DefaultRecall
 	}
 
+	// Client mode: the server retrieves, reranks and records the query.
+	if ds, ok := s.provider.(rag.DelegatedSearcher); ok {
+		return ds.SearchFull(ctx, projectID, query, k, recall, opts.Hybrid, opts.Rerank, opts.Compress)
+	}
+
 	// Measure retrieval latency around the provider call only (excludes rerank,
 	// which is measured separately by the reranker's own metrics if needed).
 	t0 := time.Now()
@@ -302,6 +322,9 @@ func (s *Service) Search(ctx context.Context, projectID, query string, opts Sear
 	comp := QueryComposition{
 		Hybrid:     hybridUsed,
 		Candidates: len(cands),
+		Project:    projectID,
+		Query:      truncateRunes(query, maxQueryText),
+		Client:     ClientFrom(ctx),
 	}
 	// Compute dense/lexical composition from per-result origin when the hybrid
 	// path populated it (pgvector). Non-hybrid or backends that don't project
@@ -335,8 +358,9 @@ func (s *Service) Search(ctx context.Context, projectID, query string, opts Sear
 		Timestamp: time.Now(),
 		Data: map[string]any{
 			"project_id": projectID,
-			"query":      query,
+			"query":      truncateRunes(query, maxQueryText),
 			"candidates": len(cands),
+			"client":     ClientFrom(ctx),
 		},
 	})
 
@@ -434,6 +458,14 @@ func (s *Service) IndexProject(ctx context.Context, projectID, dir string) (*ind
 		Data:      map[string]any{"project_id": projectID, "directory": dir},
 	})
 
+	if !dirExists(dir) {
+		err := fmt.Errorf("directory %q does not exist on %s — to index code that lives on another machine, run enowx-rag "+
+			"there in client mode (vector_store: remote, remote_url: this server); see Docs → Connect", dir, localHost())
+		s.events.Publish(Event{Type: "index_failed", Timestamp: time.Now(),
+			Data: map[string]any{"project_id": projectID, "error": err.Error()}})
+		return nil, err
+	}
+
 	// Chunk IDs are prefixed with the directory's base name, so two
 	// directories of one project with the same name (/x/app, /y/app) would
 	// replace each other's chunks. Refuse the second one.
@@ -476,6 +508,7 @@ func (s *Service) IndexProject(ctx context.Context, projectID, dir string) (*ind
 		idx = indexer.NewIndexer(s.provider, 1500)
 	}
 
+	started := time.Now()
 	result, err := idx.IndexProject(ctx, projectID, dir)
 	if err != nil {
 		s.events.Publish(Event{
@@ -488,6 +521,7 @@ func (s *Service) IndexProject(ctx context.Context, projectID, dir string) (*ind
 	result.Reembedded = reembedded
 
 	s.recordIndexed(projectID, dir)
+	s.reportSync(ctx, projectID, dir, result, time.Since(started))
 
 	s.events.Publish(Event{
 		Type:      "index_completed",
@@ -500,6 +534,8 @@ func (s *Service) IndexProject(ctx context.Context, projectID, dir string) (*ind
 			"files_scanned": result.FilesScanned,
 			"skipped":       result.Skipped,
 			"reembedded":    result.Reembedded,
+			"directory":     dir,
+			"host":          localHost(),
 		},
 	})
 
@@ -568,8 +604,14 @@ type ProjectLister interface {
 
 // CreateProject creates a new RAG collection for the given project.
 func (s *Service) CreateProject(ctx context.Context, projectID string) error {
+	// Client-mode machines create the collection before every sync: only a
+	// new project is worth an activity entry.
+	existed := s.ProjectExists(ctx, projectID)
 	if err := s.provider.CreateCollection(ctx, projectID); err != nil {
 		return err
+	}
+	if existed {
+		return nil
 	}
 	s.events.Publish(Event{
 		Type:      "project_created",
@@ -587,6 +629,11 @@ func (s *Service) DeleteProject(ctx context.Context, projectID string) error {
 	if s.syncer != nil {
 		if err := s.syncer.registry.Remove(projectID); err != nil {
 			fmt.Fprintf(os.Stderr, "auto-sync: could not forget %s: %v\n", projectID, err)
+		}
+	}
+	if s.sources != nil {
+		if err := s.sources.Remove(projectID); err != nil {
+			fmt.Fprintf(os.Stderr, "sources: could not forget %s: %v\n", projectID, err)
 		}
 	}
 	s.events.Publish(Event{
@@ -658,8 +705,21 @@ func (s *Service) DeletePoints(ctx context.Context, projectID string, pointIDs [
 // IndexDocuments indexes a batch of documents into the project collection
 // directly (without scanning a directory). This is used by the rag_index MCP tool.
 func (s *Service) IndexDocuments(ctx context.Context, projectID string, docs []rag.Document) error {
+	return s.indexDocuments(ctx, projectID, docs, false)
+}
+
+// IndexDocumentsQuiet is IndexDocuments without an activity event: used for
+// the batches a client-mode sync sends, which report once when done.
+func (s *Service) IndexDocumentsQuiet(ctx context.Context, projectID string, docs []rag.Document) error {
+	return s.indexDocuments(ctx, projectID, docs, true)
+}
+
+func (s *Service) indexDocuments(ctx context.Context, projectID string, docs []rag.Document, quiet bool) error {
 	if err := s.provider.Index(ctx, projectID, docs); err != nil {
 		return fmt.Errorf("index documents: %w", err)
+	}
+	if quiet {
+		return nil
 	}
 	s.events.Publish(Event{
 		Type:      "documents_indexed",

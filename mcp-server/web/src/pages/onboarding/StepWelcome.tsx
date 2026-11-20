@@ -1,111 +1,129 @@
-import { useEffect, useState } from 'react'
-import { ChevronRight, ChevronLeft } from 'lucide-react'
+import { useState } from 'react'
+import { ChevronRight, Loader2, Sparkles } from 'lucide-react'
+import { errorText, type SetupApplyRequest } from '../../lib/api'
+import { formatNumber } from '../../lib/format'
+import { ErrorBox, SuccessBox } from '../../components/ui'
+import { draftToRequest, fullyFromEnv, storeFromEnv, type StepProps } from './types'
 
-interface StepWelcomeProps {
-  onNext: () => void
-}
+type Tone = 'good' | 'warn' | 'crit' | 'muted'
 
-interface EnvCheck {
-  label: string
-  status: 'ok' | 'fail' | 'checking' | 'unknown'
-  detail: string
-}
-
-export function StepWelcome({ onNext }: StepWelcomeProps) {
-  const [envChecks, setEnvChecks] = useState<EnvCheck[]>([
-    { label: 'Docker', status: 'checking', detail: 'checking…' },
-    { label: 'PostgreSQL (:5432)', status: 'checking', detail: 'checking…' },
-    { label: 'Qdrant (:6333)', status: 'checking', detail: 'checking…' },
-    { label: 'TEI Embedder (:8081)', status: 'checking', detail: 'checking…' },
-  ])
-
-  useEffect(() => {
-    // Check ports by attempting to reach the setup/status endpoint
-    // and doing lightweight port checks. Since the SPA can't do raw
-    // TCP, we use a heuristic: if the API is up, we know PostgreSQL is
-    // available (the server itself uses it). For Docker and other
-    // services, we check connectivity indirectly.
-    const checks: Promise<EnvCheck>[] = [
-      checkDocker(),
-      checkPostgres(),
-      checkPort('Qdrant (:6333)', 6333, 'http://localhost:6333/healthz'),
-      checkPort('TEI Embedder (:8081)', 8081, 'http://localhost:8081/health'),
-    ]
-
-    Promise.all(checks).then(setEnvChecks)
-  }, [])
-
+function DetectItem({ label, value, tone, detail }: { label: string; value: string; tone: Tone; detail?: string }) {
+  const color = tone === 'good' ? 'var(--good)' : tone === 'warn' ? 'var(--warn)' : tone === 'crit' ? 'var(--crit)' : 'var(--text-faint)'
   return (
-    <div className="card">
-      <div className="card-head">
-        <h2>Welcome to enowx-rag</h2>
-        <span className="step-badge mono">1 / 7</span>
-        <span className="card-hint">First-run setup</span>
+    <div className="env-item detect-item">
+      <span className="status-dot" style={{ background: color }} />
+      <div className="detect-main">
+        <span className="env-label">{label}</span>
+        {detail && <span className="detect-detail">{detail}</span>}
       </div>
-      <div className="card-body">
-        <p>
-          This wizard will guide you through configuring your RAG memory server. You will set up a{' '}
-          <b>vector store</b>, choose an <b>embedding provider</b>, <b>test</b> connectivity,
-          optionally run <b>auto-setup</b> for local backends, and then start indexing your projects.
-        </p>
-
-        <div className="field-label">Environment detection</div>
-        <div className="env-grid">
-          {envChecks.map((item) => (
-            <div key={item.label} className="env-item">
-              <span
-                className="status-dot"
-                style={{
-                  background:
-                    item.status === 'ok' ? 'var(--good)' : item.status === 'fail' ? 'var(--text-faint)' : 'var(--warn)',
-                }}
-              />
-              <span className="env-label">{item.label}</span>
-              <span className={`env-val mono ${item.status === 'ok' ? 'ok' : ''}`}>{item.detail}</span>
-            </div>
-          ))}
-        </div>
-
-        <p className="welcome-explain">
-          The wizard will configure: (1) vector store selection, (2) embedding provider, (3) connection
-          test, (4) optional auto-setup for local Docker backends, (5) save configuration to{' '}
-          <code className="mono">~/.enowx-rag/config.yaml</code>.
-        </p>
-      </div>
-      <div className="nav-buttons">
-        <button className="btn ghost" disabled>
-          <ChevronLeft size={14} /> Back
-        </button>
-        <div className="spacer" />
-        <button className="btn primary" onClick={onNext}>
-          Get Started <ChevronRight size={14} />
-        </button>
-      </div>
+      <span className={`env-val mono ${tone === 'good' ? 'ok' : ''}`}>{value}</span>
     </div>
   )
 }
 
-// Docker and PostgreSQL cannot be probed from a browser (no raw TCP, no shell).
-// Rather than report a misleading "available", we say so honestly and point the
-// user at the CLI (`enowx-rag setup --run`), which verifies them for real.
-async function checkDocker(): Promise<EnvCheck> {
-  return { label: 'Docker', status: 'unknown', detail: 'verify via CLI' }
-}
+export function StepWelcome({ cfg, env, onNext, onApply }: StepProps & { onApply: (req: SetupApplyRequest) => Promise<void> }) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const d = env.detect
+  const allSet = fullyFromEnv(env)
 
-async function checkPostgres(): Promise<EnvCheck> {
-  return { label: 'PostgreSQL (:5432)', status: 'unknown', detail: 'verify via CLI' }
-}
-
-// checkPort attempts a real reachability check for HTTP services (Qdrant/TEI
-// expose health endpoints). no-cors resolves opaquely when the port is open.
-async function checkPort(label: string, _port: number, url: string): Promise<EnvCheck> {
-  try {
-    const resp = await fetch(url, { signal: AbortSignal.timeout(3000), mode: 'no-cors' })
-    if (resp.type === 'opaque' || resp.ok) {
-      return { label, status: 'ok', detail: `:${_port} — reachable` }
+  const finishFast = async () => {
+    setBusy(true)
+    setError('')
+    try {
+      await onApply(draftToRequest(cfg, env))
+    } catch (e) {
+      setError(errorText(e, 'Could not apply the configuration'))
+    } finally {
+      setBusy(false)
     }
-    return { label, status: 'fail', detail: `:${_port} — not reachable` }
-  } catch {
-    return { label, status: 'fail', detail: `:${_port} — not reachable` }
   }
+
+  const store = d?.store
+  const versions = [store?.server_version, store?.extension_version ? `pgvector ${store.extension_version}` : ''].filter(Boolean).join(' · ')
+
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h2>Set up this enowx-rag server</h2>
+        <span className="step-badge mono">1 / 6</span>
+      </div>
+      <div className="card-body">
+        <p>
+          This server will hold the RAG memory for all your machines: it stores chunks in a database, embeds and reranks them with
+          Voyage AI and shows everything on this dashboard. Your laptops connect in <b>client mode</b> afterwards.
+        </p>
+
+        <div className="field-label">Detected on this server</div>
+        {d ? (
+          <div className="env-grid">
+            <DetectItem
+              label="Database"
+              value={store?.ok ? 'reachable' : store?.type ? 'not reachable' : 'not set'}
+              tone={store?.ok ? 'good' : store?.type && storeFromEnv(env) ? 'crit' : 'muted'}
+              detail={[store?.type, versions, store?.dsn_masked, storeFromEnv(env) ? 'from environment' : ''].filter(Boolean).join(' · ') || store?.message}
+            />
+            <DetectItem
+              label="Voyage API key"
+              value={d.voyage_key_from_env ? 'from env' : d.voyage_key_set ? 'saved' : 'missing'}
+              tone={d.voyage_key_from_env || d.voyage_key_set ? 'good' : 'warn'}
+              detail={d.voyage_key_from_env ? 'RAG_VOYAGE_API_KEY' : d.voyage_key_set ? 'in config.yaml' : 'you will enter it in the Models step'}
+            />
+            <DetectItem
+              label="Admin token"
+              value={env.status?.auth_required ? 'required' : 'none'}
+              tone={env.status?.auth_required ? 'good' : 'warn'}
+              detail={env.status?.auth_required ? 'dashboard and API are protected' : 'you can generate one in the Connect step'}
+            />
+            {d.sqlite_store && d.sqlite_store.points > 0 ? (
+              <DetectItem
+                label="Existing SQLite memory"
+                value={`${formatNumber(d.sqlite_store.points)} chunks`}
+                tone="muted"
+                detail={d.sqlite_store.path}
+              />
+            ) : (
+              <DetectItem
+                label="Config file"
+                value={env.status?.config_file_exists ? 'exists' : 'new'}
+                tone="muted"
+                detail={env.status?.config_path}
+              />
+            )}
+          </div>
+        ) : (
+          <div className="panel-empty">Detection is unavailable — the following steps ask for everything.</div>
+        )}
+        {store && !store.ok && store.message && <div className="field-hint">{store.message}</div>}
+
+        {allSet ? (
+          <SuccessBox>
+            <b>Everything is configured by the environment.</b> Database and Voyage key are set; finishing applies the
+            recommended models ({cfg.voyageModel} · {cfg.voyageDim}, reranker {cfg.rerankerModel || 'off'}) and restarts the server.
+          </SuccessBox>
+        ) : (
+          <p className="welcome-explain">
+            Next: pick the database, choose Voyage models (with prices and limits), review a live connection test, then apply —
+            the server restarts by itself. Everything detected above is pre-filled.
+          </p>
+        )}
+        {error && <ErrorBox>{error}</ErrorBox>}
+      </div>
+      <div className="nav-buttons">
+        {allSet && (
+          <button className="btn ghost" onClick={onNext} disabled={busy}>Customize instead</button>
+        )}
+        <div className="spacer" />
+        {allSet ? (
+          <button className="btn primary" onClick={finishFast} disabled={busy}>
+            {busy ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />} Everything is configured — finish
+          </button>
+        ) : (
+          <button className="btn primary" onClick={onNext}>
+            Get started <ChevronRight size={14} />
+          </button>
+        )}
+      </div>
+    </div>
+  )
 }

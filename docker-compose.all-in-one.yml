@@ -32,7 +32,7 @@ services:
       RAG_EMBEDDER: "voyage"
       RAG_VOYAGE_API_KEY: "${RAG_VOYAGE_API_KEY:-}"
       RAG_VOYAGE_MODEL: "voyage-4"
-      RAG_RERANKER_MODEL: "rerank-2.5"
+      RAG_RERANKER_MODEL: "rerank-3"
 
       # --- Qdrant config (when RAG_VECTOR_STORE=qdrant) ---
       RAG_QDRANT_URL: "http://qdrant:6333"
@@ -48,14 +48,16 @@ services:
     depends_on:
       qdrant:
         condition: service_healthy
+    # config.yaml (settings saved from the dashboard) and metrics.db.
+    volumes:
+      - enowx-data:/data
     restart: unless-stopped
-    # ENTRYPOINT in Dockerfile is ["./enowx-rag"], so command must NOT
+    # ENTRYPOINT in Dockerfile is ["enowx-rag"], so command must NOT
     # include the binary name — only the flags to pass to it.
     command: ["--serve", "--addr", ":7777"]
     healthcheck:
-      # When RAG_ADMIN_TOKEN is set, /api/* requires an Authorization header.
-      # Use a shell-form test so the header is sent only when the token is set.
-      test: ["CMD-SHELL", "wget --spider -q --header=\"$${RAG_ADMIN_TOKEN:+Authorization: Bearer $$RAG_ADMIN_TOKEN}\" http://localhost:7777/api/stats"]
+      # /api/health is open (no admin token needed).
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7777/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -114,6 +116,7 @@ services:
   #     retries: 3
 
 volumes:
+  enowx-data:
   qdrant-data:
   # postgres-data:
   # tei-data:

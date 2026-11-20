@@ -1,38 +1,84 @@
-import { useState, useCallback, useEffect } from 'react'
-import { Sun, Moon } from 'lucide-react'
-import { STEPS, STEP_LABELS, defaultDraft, type Step, type DraftConfig } from './types'
+import { useState, useCallback, useEffect, useRef } from 'react'
+import { Sun, Moon, Loader2 } from 'lucide-react'
+import { api, ApiError, errorText, isAuthError, type SetupApplyRequest } from '../../lib/api'
+import { Brand } from '../../components/Login'
+import { RestartOverlay } from '../../components/RestartOverlay'
+import { ErrorBox } from '../../components/ui'
+import { STEPS, STEP_LABELS, SECRET_FIELDS, defaultDraft, prefill, type Step, type DraftConfig, type WizardEnv } from './types'
 import { StepWelcome } from './StepWelcome'
-import { StepVectorStore } from './StepVectorStore'
-import { StepEmbedding } from './StepEmbedding'
-import { StepTest } from './StepTest'
-import { StepAutoSetup } from './StepAutoSetup'
-import { StepInstall } from './StepInstall'
+import { StepDatabase } from './StepDatabase'
+import { StepModels } from './StepModels'
+import { StepReview } from './StepReview'
+import { StepConnect } from './StepConnect'
 import { StepDone } from './StepDone'
 
 interface WizardProps {
   onComplete: () => void
+  /** Setup endpoints answered 401/403: the admin token is needed first. */
+  onNeedLogin: () => void
   theme: 'light' | 'dark'
   onToggleTheme: () => void
 }
 
-export function Wizard({ onComplete, theme, onToggleTheme }: WizardProps) {
+export interface ApplyOutcome {
+  restarted: boolean
+  /** Saved, but the server could not restart itself. */
+  manualRestart: boolean
+}
+
+export function Wizard({ onComplete, onNeedLogin, theme, onToggleTheme }: WizardProps) {
   const [step, setStep] = useState<Step>(loadStep)
   const [cfg, setCfg] = useState<DraftConfig>(loadDraft)
-  const [testResults, setTestResults] = useState<{
-    vectorStore: { ok: boolean; message: string; latency_ms: number } | null
-    embedder: { ok: boolean; message: string; latency_ms: number } | null
-  }>({ vectorStore: null, embedder: null })
+  const [env, setEnv] = useState<WizardEnv>({ status: null, detect: null, models: null })
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
+  const [restart, setRestart] = useState<{ prevBootId: string } | null>(null)
+  const [outcome, setOutcome] = useState<ApplyOutcome | null>(null)
+  const needLogin = useRef(onNeedLogin)
+  needLogin.current = onNeedLogin
 
-  // Persist full draft config to localStorage on every change (VAL-WIZ-033).
+  // Detect what the server already knows and pre-fill the draft.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const status = await api.setupStatus()
+        const detect = await api.detect()
+        const models = await api.models().catch((e) => {
+          if (isAuthError(e)) throw e
+          return null
+        })
+        if (cancelled) return
+        const next = { status, detect, models }
+        setEnv(next)
+        setCfg((c) => (c.prefilled ? c : prefill(c, next)))
+      } catch (e) {
+        if (cancelled) return
+        if (isAuthError(e)) {
+          needLogin.current()
+          return
+        }
+        setLoadError(errorText(e, 'Could not ask the server what it already has.'))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Persist the draft (without secrets) and the step.
   useEffect(() => {
     try {
-      localStorage.setItem('wizard-draft', JSON.stringify(cfg))
+      const safe: Partial<DraftConfig> = { ...cfg }
+      for (const k of SECRET_FIELDS) delete safe[k]
+      localStorage.setItem('wizard-draft', JSON.stringify(safe))
     } catch {
       // ignore
     }
   }, [cfg])
 
-  // Persist step position to localStorage on every change (VAL-WIZ-033).
   useEffect(() => {
     try {
       localStorage.setItem('wizard-step', step)
@@ -42,39 +88,61 @@ export function Wizard({ onComplete, theme, onToggleTheme }: WizardProps) {
   }, [step])
 
   const stepIndex = STEPS.indexOf(step)
-
+  const go = useCallback((s: Step) => {
+    setStep(s)
+    window.scrollTo({ top: 0 })
+  }, [])
   const next = useCallback(() => {
-    if (stepIndex < STEPS.length - 1) {
-      setStep(STEPS[stepIndex + 1])
-    }
-  }, [stepIndex])
-
+    if (stepIndex < STEPS.length - 1) go(STEPS[stepIndex + 1])
+  }, [stepIndex, go])
   const back = useCallback(() => {
-    if (stepIndex > 0) {
-      setStep(STEPS[stepIndex - 1])
-    }
-  }, [stepIndex])
+    if (stepIndex > 0) go(STEPS[stepIndex - 1])
+  }, [stepIndex, go])
 
   const updateCfg = useCallback((patch: Partial<DraftConfig>) => {
     setCfg((prev) => ({ ...prev, ...patch }))
   }, [])
 
-  // Check if test step can proceed: vector store and embedder must pass.
-  const testPassed =
-    testResults.vectorStore?.ok === true && testResults.embedder?.ok === true
+  /** POST /api/setup/apply (with restart when supported), then wait for the new process. */
+  const apply = useCallback(async (req: SetupApplyRequest) => {
+    let prevBootId = ''
+    try {
+      prevBootId = (await api.health()).boot_id
+    } catch {
+      // ignore: the restart wait falls back to "any boot id"
+    }
+    const canRestart = env.status?.restart_supported !== false
+    try {
+      const res = await api.setupApply({ ...req, restart: canRestart })
+      if (res.restarting) {
+        setRestart({ prevBootId })
+      } else {
+        setOutcome({ restarted: false, manualRestart: true })
+        go('connect')
+      }
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 403) needLogin.current()
+      throw e
+    }
+  }, [env.status, go])
+
+  const finish = useCallback(() => {
+    try {
+      localStorage.removeItem('wizard-draft')
+      localStorage.removeItem('wizard-step')
+    } catch {
+      // ignore
+    }
+    onComplete()
+  }, [onComplete])
+
+  const stepProps = { cfg, updateCfg, env, onBack: back, onNext: next }
 
   return (
     <div className="wizard-shell">
-      {/* Top bar */}
       <div className="wizard-topbar">
-        <div className="brand">
-          <div className="brand-mark">
-            <img className="brand-img brand-img-light" src="/icon-light-512.png" alt="enowx-rag" />
-            <img className="brand-img brand-img-dark" src="/icon-dark-512.png" alt="" aria-hidden="true" />
-          </div>
-          <div className="brand-name">enowx<span>·rag</span></div>
-        </div>
-        <span className="wizard-subtitle">Setup Wizard</span>
+        <Brand />
+        <span className="wizard-subtitle">Server setup</span>
         <div className="topbar-spacer" />
         <button className="icon-btn" onClick={onToggleTheme} title="Toggle theme">
           {theme === 'dark' ? <Sun size={15} strokeWidth={1.7} /> : <Moon size={15} strokeWidth={1.7} />}
@@ -82,7 +150,6 @@ export function Wizard({ onComplete, theme, onToggleTheme }: WizardProps) {
       </div>
 
       <div className="wizard-container">
-        {/* Step indicator */}
         <div className="stepper">
           {STEPS.map((s, i) => (
             <div key={s} className={`step-group ${i === stepIndex ? 'current' : ''} ${i < stepIndex ? 'completed' : ''}`}>
@@ -95,57 +162,40 @@ export function Wizard({ onComplete, theme, onToggleTheme }: WizardProps) {
           ))}
         </div>
 
-        {/* Step content */}
-        {step === 'welcome' && (
-          <StepWelcome onNext={next} />
-        )}
-        {step === 'vector' && (
-          <StepVectorStore
-            cfg={cfg}
-            updateCfg={updateCfg}
-            onBack={back}
-            onNext={next}
-          />
-        )}
-        {step === 'embedding' && (
-          <StepEmbedding
-            cfg={cfg}
-            updateCfg={updateCfg}
-            onBack={back}
-            onNext={next}
-          />
-        )}
-        {step === 'test' && (
-          <StepTest
-            cfg={cfg}
-            testResults={testResults}
-            setTestResults={setTestResults}
-            testPassed={testPassed}
-            onBack={back}
-            onNext={next}
-          />
-        )}
-        {step === 'setup' && (
-          <StepAutoSetup
-            cfg={cfg}
-            onBack={back}
-            onNext={next}
-          />
-        )}
-        {step === 'install' && (
-          <StepInstall
-            onBack={back}
-            onNext={next}
-          />
-        )}
-        {step === 'done' && (
-          <StepDone
-            cfg={cfg}
-            onBack={back}
-            onComplete={onComplete}
-          />
+        {loading ? (
+          <div className="card">
+            <div className="card-body inline-loading"><Loader2 size={15} className="spin" /> Checking what this server already has…</div>
+          </div>
+        ) : (
+          <>
+            {loadError && <ErrorBox>{loadError} You can still configure everything by hand.</ErrorBox>}
+            {step === 'welcome' && <StepWelcome {...stepProps} onApply={apply} />}
+            {step === 'database' && <StepDatabase {...stepProps} />}
+            {step === 'models' && <StepModels {...stepProps} />}
+            {step === 'review' && <StepReview {...stepProps} onApply={apply} />}
+            {step === 'connect' && <StepConnect {...stepProps} outcome={outcome} />}
+            {step === 'done' && <StepDone {...stepProps} onFinish={finish} />}
+          </>
         )}
       </div>
+
+      {restart && (
+        <RestartOverlay
+          prevBootId={restart.prevBootId}
+          title="Applying configuration"
+          detail="Saving config.yaml and restarting the server with the new database and models."
+          onDone={() => {
+            setRestart(null)
+            setOutcome({ restarted: true, manualRestart: false })
+            go('connect')
+          }}
+          onDismiss={() => {
+            setRestart(null)
+            setOutcome({ restarted: false, manualRestart: true })
+            go('connect')
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -153,9 +203,7 @@ export function Wizard({ onComplete, theme, onToggleTheme }: WizardProps) {
 function loadStep(): Step {
   try {
     const stored = localStorage.getItem('wizard-step')
-    if (stored && (STEPS as readonly string[]).includes(stored)) {
-      return stored as Step
-    }
+    if (stored && (STEPS as readonly string[]).includes(stored)) return stored as Step
   } catch {
     // ignore
   }
@@ -165,9 +213,7 @@ function loadStep(): Step {
 function loadDraft(): DraftConfig {
   try {
     const stored = localStorage.getItem('wizard-draft')
-    if (stored) {
-      return { ...defaultDraft, ...JSON.parse(stored) }
-    }
+    if (stored) return { ...defaultDraft, ...JSON.parse(stored) }
   } catch {
     // ignore
   }

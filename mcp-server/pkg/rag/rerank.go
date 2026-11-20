@@ -14,30 +14,32 @@ import (
 const (
 	// voyageRerankURL is the default endpoint for the Voyage AI rerank API.
 	voyageRerankURL = "https://api.voyageai.com/v1/rerank"
-	// DefaultRerankModel is the default rerank model used by VoyageReranker.
-	DefaultRerankModel = "rerank-2.5"
+	// DefaultRerankModel is the default rerank model used by VoyageReranker
+	// (Voyage's recommended reranker, see voyage_models.go).
+	DefaultRerankModel = "rerank-3"
 )
 
 // VoyageReranker implements the Reranker interface by calling the
 // Voyage AI rerank API (https://api.voyageai.com/v1/rerank).
 type VoyageReranker struct {
 	APIKey  string
-	Model   string // defaults to "rerank-2.5"
+	Model   string // defaults to DefaultRerankModel
 	client  *http.Client
-	baseURL string // override for testing; defaults to voyageRerankURL
+	baseURL string       // override for testing; defaults to voyageRerankURL
 	tokens  atomic.Int64 // cumulative total_tokens reported by the API
 }
 
 // NewVoyageReranker creates a VoyageReranker with the given API key.
-// If model is empty, it defaults to "rerank-2.5".
+// If model is empty, it defaults to DefaultRerankModel.
 func NewVoyageReranker(apiKey, model string) *VoyageReranker {
 	if model == "" {
 		model = DefaultRerankModel
 	}
 	return &VoyageReranker{
-		APIKey: apiKey,
-		Model:  model,
-		client: &http.Client{Timeout: 120 * time.Second},
+		APIKey:  apiKey,
+		Model:   model,
+		baseURL: voyageEndpoint("rerank"),
+		client:  &http.Client{Timeout: 120 * time.Second},
 	}
 }
 
@@ -95,7 +97,7 @@ func (r *VoyageReranker) Rerank(ctx context.Context, query string, docs []string
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("voyage rerank returned %d: %s", resp.StatusCode, string(b))
+		return nil, voyageError("rerank", r.Model, resp.StatusCode, b)
 	}
 
 	var result voyageRerankResponse

@@ -135,11 +135,71 @@ func TestReindexReportsReembedded(t *testing.T) {
 	req.RemoteAddr = "127.0.0.1:1"
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	var resp map[string]any
-	_ = json.Unmarshal(w.Body.Bytes(), &resp)
-	if w.Code != http.StatusOK || resp["points_reembedded"] != float64(2) {
-		t.Fatalf("reindex = %d %s, want 200 with points_reembedded 2", w.Code, w.Body.String())
+	var resp struct {
+		Job  Job    `json:"job"`
+		Mode string `json:"mode"`
 	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if w.Code != http.StatusAccepted || resp.Mode != "files" || resp.Job.ID == "" {
+		t.Fatalf("reindex = %d %s, want 202 with a files job", w.Code, w.Body.String())
+	}
+	job := waitJob(t, router, resp.Job.ID)
+	synced, _ := job.Result["synced"].(map[string]any)
+	if job.State != "done" || synced["reembedded"] != float64(2) {
+		t.Fatalf("job = %+v, want done with 2 re-embedded", job)
+	}
+}
+
+// Without a path and without a source on this server, reindex re-embeds the
+// stored chunks (the code lives on client machines).
+func TestReindexWithoutPathReembeds(t *testing.T) {
+	embedURL := fakeEmbeddings(t, 4).URL
+	path := filepath.Join(t.TempDir(), "rag.db")
+	runningSQLite(t, path, embedURL).Close()
+	p, err := rag.NewSQLiteProvider(path, rag.NewOpenAIEmbeddingClient("", "new-model", embedURL, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	_, router := newTestServer(t, p, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/projects/p/reindex", nil)
+	req.RemoteAddr = "127.0.0.1:1"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	var resp struct {
+		Job  Job    `json:"job"`
+		Mode string `json:"mode"`
+		Note string `json:"note"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if w.Code != http.StatusAccepted || resp.Mode != "reembed" || resp.Note == "" {
+		t.Fatalf("reindex = %d %s, want 202 reembed with a note", w.Code, w.Body.String())
+	}
+	job := waitJob(t, router, resp.Job.ID)
+	if job.State != "done" || job.Result["reembedded"] != float64(2) {
+		t.Fatalf("job = %+v, want done with 2 re-embedded", job)
+	}
+}
+
+// waitJob polls GET /api/jobs/{id} until the job finishes.
+func waitJob(t *testing.T, router http.Handler, id string) Job {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest(http.MethodGet, "/api/jobs/"+id, nil)
+		req.RemoteAddr = "127.0.0.1:1"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		var job Job
+		_ = json.Unmarshal(w.Body.Bytes(), &job)
+		if job.State != "" && job.State != "running" {
+			return job
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("job %s did not finish", id)
+	return Job{}
 }
 
 // A typed "~/" path is the home folder; an empty one the running store's file.

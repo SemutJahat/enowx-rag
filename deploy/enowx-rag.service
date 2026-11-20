@@ -1,0 +1,35 @@
+# systemd unit for enowx-rag without Docker (binary from install.sh, PostgreSQL
+# with pgvector installed on the host or elsewhere).
+#
+#   sudo useradd --system --create-home --home-dir /var/lib/enowx-rag enowx
+#   sudo cp deploy/enowx-rag.service /etc/systemd/system/
+#   sudo install -m 600 -o enowx /dev/null /etc/enowx-rag.env   # then fill it (see below)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now enowx-rag
+#
+# /etc/enowx-rag.env:
+#   RAG_VECTOR_STORE=pgvector
+#   RAG_PGVECTOR_DSN=postgres://enowx:PASSWORD@localhost:5432/enowxrag?sslmode=disable
+#   RAG_ADMIN_TOKEN=...            # openssl rand -hex 32
+#   RAG_VOYAGE_API_KEY=pa-...      # or set it in the dashboard
+#
+# The dashboard's "Restart" re-executes the binary in place (same PID).
+
+[Unit]
+Description=enowx-rag (RAG memory server: dashboard, API, MCP)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=enowx
+Environment=HOME=/var/lib/enowx-rag
+EnvironmentFile=/etc/enowx-rag.env
+ExecStart=/usr/local/bin/enowx-rag --serve --addr 127.0.0.1:7777
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/enowx-rag
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"encoding/json"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/enowdev/enowx-rag/mcp-server/pkg/config"
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/core"
 )
 
@@ -23,7 +23,9 @@ func helperClearRagEnv(t *testing.T) func() {
 		"RAG_CHROMA_URL", "RAG_PGVECTOR_DSN",
 		"RAG_TEI_URL",
 		"RAG_VOYAGE_API_KEY", "RAG_VOYAGE_MODEL", "RAG_VECTOR_DIM",
-		"RAG_RERANKER_MODEL",
+		"RAG_RERANKER_MODEL", "RAG_SQLITE_PATH", "RAG_AUTO_SYNC_INTERVAL", "RAG_ADMIN_TOKEN",
+		"RAG_OPENAI_API_KEY", "RAG_OPENAI_MODEL", "RAG_OPENAI_BASE_URL", "RAG_OPENAI_DIM",
+		"RAG_REMOTE_URL", "RAG_REMOTE_TOKEN", "RAG_AUTO_IMPORT_SQLITE",
 	}
 	saved := make(map[string]string)
 	for _, k := range keys {
@@ -94,8 +96,23 @@ func TestSetupStatus_Configured(t *testing.T) {
 
 	p := &mockProvider{}
 	_, router := newTestServer(t, p, nil)
+	t.Setenv("HOME", tmpDir)
 
+	// Incomplete: pgvector without a DSN, voyage without a key.
 	req := httptest.NewRequest(http.MethodGet, "/api/setup/status", nil)
+	w0 := httptest.NewRecorder()
+	router.ServeHTTP(w0, req)
+	var partial setupStatusResponse
+	_ = json.Unmarshal(w0.Body.Bytes(), &partial)
+	if partial.Configured || !partial.ConfigFileExists || strings.Join(partial.Missing, ",") != "pgvector_dsn,voyage_api_key" {
+		t.Fatalf("incomplete config: %+v, want configured=false missing=[pgvector_dsn voyage_api_key]", partial)
+	}
+
+	full := "vector_store: pgvector\npgvector_dsn: postgres://u@h/db\nembedder: voyage\nvoyage:\n  api_key: pa-x\n"
+	if err := os.WriteFile(configPath, []byte(full), 0600); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/setup/status", nil)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -108,7 +125,7 @@ func TestSetupStatus_Configured(t *testing.T) {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
 	if !resp.Configured {
-		t.Error("expected configured=true when config file exists")
+		t.Errorf("expected configured=true for a complete config file: %s", w.Body.String())
 	}
 }
 
@@ -247,33 +264,72 @@ func TestSetupApply_WritesValidYAML(t *testing.T) {
 	}
 }
 
-// TestSetupApply_MissingVectorStore verifies that POST /api/setup/apply
-// returns 400 when vector_store is missing.
-func TestSetupApply_MissingVectorStore(t *testing.T) {
+// TestSetupApply_MergesWithDefaults verifies that POST /api/setup/apply
+// without vector_store keeps the default store (settings are merged).
+func TestSetupApply_MergesWithDefaults(t *testing.T) {
 	cleanup := helperClearRagEnv(t)
 	defer cleanup()
 
+	p := &mockProvider{}
+	_, router := newTestServer(t, p, nil)
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
 
-	p := &mockProvider{}
-	_, router := newTestServer(t, p, nil)
-
-	body := `{"embedder":"voyage"}`
+	body := `{"embedder":"voyage","voyage_api_key":"pa-merge-key"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/setup/apply", strings.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:12345"
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400, got %d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
+	data, err := os.ReadFile(filepath.Join(tmpDir, ".enowx-rag", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "vector_store: "+config.Default().VectorStore) || !strings.Contains(string(data), "api_key: pa-merge-key") {
+		t.Errorf("config.yaml = %s, want the default store and the key", data)
+	}
+	if !strings.Contains(string(data), "reranker_model: rerank-3") {
+		t.Errorf("config.yaml = %s, want the default reranker rerank-3", data)
+	}
+}
 
-	var errResp map[string]string
-	json.Unmarshal(w.Body.Bytes(), &errResp)
-	if errResp["error"] == "" {
-		t.Error("expected error field in response")
+// TestSetupApply_SkipsEnvLocked verifies that a setting an environment
+// variable fixes is not copied into config.yaml and is reported.
+func TestSetupApply_SkipsEnvLocked(t *testing.T) {
+	cleanup := helperClearRagEnv(t)
+	defer cleanup()
+
+	p := &mockProvider{}
+	_, router := newTestServer(t, p, nil)
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	t.Setenv("RAG_PGVECTOR_DSN", "postgres://env@db:5432/x")
+	t.Setenv("RAG_VECTOR_STORE", "pgvector")
+
+	body := `{"vector_store":"pgvector","embedder":"voyage","voyage_api_key":"pa-k","pgvector_dsn":"postgres://other@h/y","reranker_model":""}`
+	req := httptest.NewRequest(http.MethodPost, "/api/setup/apply", strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "RAG_PGVECTOR_DSN") {
+		t.Errorf("response should warn about RAG_PGVECTOR_DSN: %s", w.Body.String())
+	}
+	data, _ := os.ReadFile(filepath.Join(tmpDir, ".enowx-rag", "config.yaml"))
+	if strings.Contains(string(data), "postgres://") {
+		t.Errorf("config.yaml must not get the DSN the environment fixes: %s", data)
+	}
+	if !strings.Contains(string(data), "vector_store: pgvector") {
+		t.Errorf("an env-locked non-secret setting with the same value should be written: %s", data)
+	}
+	if !strings.Contains(string(data), "reranker_model: \"off\"") && !strings.Contains(string(data), "reranker_model: off") {
+		t.Errorf("reranker_model \"\" should save as off: %s", data)
 	}
 }
 
@@ -439,28 +495,14 @@ func TestSetupTest_QdrantFail(t *testing.T) {
 // TestSetupTest_PGVectorSuccess verifies that POST /api/setup/test returns
 // ok=true for pgvector when the PostgreSQL server is reachable (TCP dial).
 func TestSetupTest_PGVectorSuccess(t *testing.T) {
+	dsn := os.Getenv("RAG_TEST_PGVECTOR_DSN")
+	if dsn == "" {
+		t.Skip("set RAG_TEST_PGVECTOR_DSN to a PostgreSQL with pgvector to run this test")
+	}
 	p := &mockProvider{}
 	_, router := newTestServer(t, p, nil)
 
-	// The pgvector connectivity check only dials TCP, so a bare listener on
-	// localhost stands in for a real PostgreSQL — no DB required, works in CI.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			conn.Close()
-		}
-	}()
-
-	dsn := "postgresql://user@" + ln.Addr().String() + "/db"
-	body := `{"vector_store":"pgvector","embedder":"voyage","voyage_api_key":"test-key","pgvector_dsn":"` + dsn + `"}`
+	body := `{"vector_store":"pgvector","embedder":"tei","tei_url":"http://127.0.0.1:1","pgvector_dsn":"` + dsn + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/setup/test", strings.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:12345"
 	req.Header.Set("Content-Type", "application/json")
@@ -476,8 +518,8 @@ func TestSetupTest_PGVectorSuccess(t *testing.T) {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
 
-	if !resp.VectorStore.OK {
-		t.Errorf("expected vector_store ok=true for local PostgreSQL, got false: %s", resp.VectorStore.Message)
+	if !resp.VectorStore.OK || !strings.Contains(resp.VectorStore.Message, "pgvector") {
+		t.Errorf("expected vector_store ok with versions, got %v: %s", resp.VectorStore.OK, resp.VectorStore.Message)
 	}
 }
 
@@ -511,32 +553,31 @@ func TestSetupTest_PGVectorFail(t *testing.T) {
 	}
 }
 
-// TestSetupTest_MissingFields verifies that POST /api/setup/test returns
-// 400 when vector_store or embedder is missing.
-func TestSetupTest_MissingFields(t *testing.T) {
+// TestSetupTest_FallsBackToRunningConfig verifies that POST /api/setup/test
+// fills fields the wizard leaves empty from the running configuration.
+func TestSetupTest_FallsBackToRunningConfig(t *testing.T) {
+	cleanup := helperClearRagEnv(t)
+	defer cleanup()
 	p := &mockProvider{}
 	_, router := newTestServer(t, p, nil)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("RAG_VECTOR_STORE", "sqlite")
+	t.Setenv("RAG_SQLITE_PATH", filepath.Join(t.TempDir(), "rag.db"))
 
-	// Missing vector_store.
-	body := `{"embedder":"voyage"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/setup/test", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/setup/test", strings.NewReader(`{}`))
 	req.RemoteAddr = "127.0.0.1:12345"
-	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing vector_store, got %d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-
-	// Missing embedder.
-	body = `{"vector_store":"qdrant"}`
-	req = httptest.NewRequest(http.MethodPost, "/api/setup/test", strings.NewReader(body))
-	req.RemoteAddr = "127.0.0.1:12345"
-	req.Header.Set("Content-Type", "application/json")
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing embedder, got %d", w.Code)
+	var resp setupTestResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !resp.VectorStore.OK || !strings.Contains(resp.VectorStore.Message, "SQLite") {
+		t.Errorf("vector_store = %+v, want the env's SQLite store ok", resp.VectorStore)
+	}
+	if resp.Embedder.OK || !strings.Contains(resp.Embedder.Message, "voyage_api_key") {
+		t.Errorf("embedder = %+v, want a missing-key message", resp.Embedder)
 	}
 }
 
@@ -710,54 +751,6 @@ func TestSetupApply_RemoteAllowedWithToken(t *testing.T) {
 	}
 }
 
-// TestInstallMCPEndpoint verifies POST /api/setup/install-mcp writes a merged
-// client config (loopback allowed) and reports the path.
-func TestInstallMCPEndpoint(t *testing.T) {
-	p := &mockProvider{}
-	_, router := newTestServer(t, p, nil)
-	// Set HOME + config AFTER newTestServer (which resets HOME for isolation).
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	// A saved config is required (mcpServerEntry loads it).
-	if err := writeTestConfig(tmp); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	body := `{"client_id":"cursor","scope":"global"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/setup/install-mcp", strings.NewReader(body))
-	req.RemoteAddr = "127.0.0.1:12345"
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("install-mcp = %d, want 200: %s", w.Code, w.Body.String())
-	}
-	// The cursor config should now exist under the temp HOME.
-	cursorPath := filepath.Join(tmp, ".cursor", "mcp.json")
-	data, err := os.ReadFile(cursorPath)
-	if err != nil {
-		t.Fatalf("cursor config not written: %v", err)
-	}
-	if !strings.Contains(string(data), "enowx-rag") {
-		t.Error("cursor config missing enowx-rag server")
-	}
-}
-
-// TestInstallMCPRemoteRejected verifies the endpoint is loopback-gated.
-func TestInstallMCPRemoteRejected(t *testing.T) {
-	t.Setenv("RAG_ADMIN_TOKEN", "")
-	p := &mockProvider{}
-	_, router := newTestServer(t, p, nil)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/setup/install-mcp", strings.NewReader(`{"client_id":"cursor"}`))
-	req.RemoteAddr = "203.0.113.9:5555"
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("remote install-mcp = %d, want 403", w.Code)
-	}
-}
-
 // TestMCPSnippetEndpoint verifies GET /api/setup/mcp-snippet returns a snippet.
 func TestMCPSnippetEndpoint(t *testing.T) {
 	p := &mockProvider{}
@@ -822,71 +815,6 @@ func TestMigrateEndpointValidates(t *testing.T) {
 }
 
 // TestWriteAgentsMD_CreateAndMerge verifies create, append (preserve), and
-// idempotent update via markers.
-func TestWriteAgentsMD_CreateAndMerge(t *testing.T) {
-	dir := t.TempDir()
-	p := &mockProvider{}
-	_, router := newTestServer(t, p, nil)
-
-	call := func(projectID string) int {
-		body := `{"dir":"` + dir + `","project_id":"` + projectID + `"}`
-		req := httptest.NewRequest(http.MethodPost, "/api/setup/write-agents-md", strings.NewReader(body))
-		req.RemoteAddr = "127.0.0.1:1"
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-		return w.Code
-	}
-
-	agentsPath := filepath.Join(dir, "AGENTS.md")
-
-	// 1. Create (no file yet).
-	if code := call("proj1"); code != 200 {
-		t.Fatalf("create = %d, want 200", code)
-	}
-	data, _ := os.ReadFile(agentsPath)
-	if !strings.Contains(string(data), "<!-- enowx-rag:start -->") || !strings.Contains(string(data), "project: proj1") {
-		t.Errorf("created AGENTS.md missing block:\n%s", data)
-	}
-
-	// 2. Update (markers present) — must stay a single block, updated id.
-	if code := call("proj2"); code != 200 {
-		t.Fatalf("update = %d, want 200", code)
-	}
-	data, _ = os.ReadFile(agentsPath)
-	if strings.Count(string(data), "<!-- enowx-rag:start -->") != 1 {
-		t.Errorf("update should keep exactly one block:\n%s", data)
-	}
-	if !strings.Contains(string(data), "project: proj2") || strings.Contains(string(data), "project: proj1") {
-		t.Errorf("update did not replace project id:\n%s", data)
-	}
-}
-
-// TestWriteAgentsMD_AppendPreservesUserContent verifies existing content is kept
-// when there are no markers.
-func TestWriteAgentsMD_AppendPreservesUserContent(t *testing.T) {
-	dir := t.TempDir()
-	userContent := "# My rules\n\nDo not break the build.\n"
-	os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(userContent), 0o644)
-
-	p := &mockProvider{}
-	_, router := newTestServer(t, p, nil)
-	body := `{"dir":"` + dir + `","project_id":"x"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/setup/write-agents-md", strings.NewReader(body))
-	req.RemoteAddr = "127.0.0.1:1"
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != 200 {
-		t.Fatalf("append = %d, want 200", w.Code)
-	}
-	data, _ := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
-	if !strings.Contains(string(data), "Do not break the build") {
-		t.Error("user content was lost")
-	}
-	if !strings.Contains(string(data), "<!-- enowx-rag:start -->") {
-		t.Error("enowx-rag block was not appended")
-	}
-}
-
 // TestProbeEndpoint verifies probe reports skill/agents_md status.
 func TestProbeEndpoint(t *testing.T) {
 	dir := t.TempDir()
@@ -949,8 +877,9 @@ func TestDocsEndpoints(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/api/docs/setup", nil)
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), "probe") {
-		t.Errorf("docs/setup alias broken: %d", w.Code)
+	if body := w.Body.String(); w.Code != 200 || !strings.Contains(body, "enowx-rag connect --remote http://example.com") ||
+		!strings.Contains(body, "    <!-- enowx-rag:start -->") || strings.Contains(body, "{{") {
+		t.Errorf("docs/setup alias broken: %d\n%s", w.Code, body)
 	}
 
 	// Unknown section -> 404
@@ -959,6 +888,32 @@ func TestDocsEndpoints(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != 404 {
 		t.Errorf("unknown section = %d, want 404", w.Code)
+	}
+}
+
+// TestRequestBaseBehindProxy: links and snippets use the URL the client
+// reached (Caddy sets X-Forwarded-Proto/Host), not the internal address.
+func TestRequestBaseBehindProxy(t *testing.T) {
+	cases := []struct {
+		proto, host, want string
+	}{
+		{"", "", "http://enowx-rag:7777"},
+		{"https", "", "https://enowx-rag:7777"},
+		{"https, http", "rag.example.com", "https://rag.example.com"},
+		{"gopher", "", "http://enowx-rag:7777"},
+		{"", "evil.com/path", "http://enowx-rag:7777"},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodGet, "http://enowx-rag:7777/api/docs/setup", nil)
+		if c.proto != "" {
+			r.Header.Set("X-Forwarded-Proto", c.proto)
+		}
+		if c.host != "" {
+			r.Header.Set("X-Forwarded-Host", c.host)
+		}
+		if got := requestBase(r); got != c.want {
+			t.Errorf("proto=%q host=%q: got %s, want %s", c.proto, c.host, got, c.want)
+		}
 	}
 }
 

@@ -9,8 +9,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// pgvectorDSN is the connection string for integration tests.
-const pgvectorDSN = "postgresql://enowdev@localhost:5432/enowxrag"
+// pgvectorDSN is the connection string for integration tests
+// (RAG_TEST_PGVECTOR_DSN overrides the default local database).
+var pgvectorDSN = func() string {
+	if v := os.Getenv("RAG_TEST_PGVECTOR_DSN"); v != "" {
+		return v
+	}
+	return "postgresql://enowdev@localhost:5432/enowxrag"
+}()
 
 // skipIfNoPostgres skips the test if PostgreSQL is not available.
 func skipIfNoPostgres(t *testing.T) {

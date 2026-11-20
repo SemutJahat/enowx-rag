@@ -16,28 +16,28 @@ import (
 // --- Mock Provider ---
 
 type mockProvider struct {
-	mu               sync.Mutex
-	createCalls      int
-	deleteCalls      int
-	indexCalls       int
-	searchCalls      int
-	deletePtCalls    int
-	listPointsCalls  int
-	closeCalls       int
+	mu              sync.Mutex
+	createCalls     int
+	deleteCalls     int
+	indexCalls      int
+	searchCalls     int
+	deletePtCalls   int
+	listPointsCalls int
+	closeCalls      int
 
 	// Hybrid search tracking
 	hybridCalls int
 
 	// Configurable behaviours
-	searchErr   error
-	searchLimit int // captured limit
-	results     []rag.Result
-	points      []rag.PointInfo
-	indexErr    error
-	createErr   error
-	deleteErr   error
-	deletePtErr  error
-	listPtsErr   error
+	searchErr        error
+	searchLimit      int // captured limit
+	results          []rag.Result
+	points           []rag.PointInfo
+	indexErr         error
+	createErr        error
+	deleteErr        error
+	deletePtErr      error
+	listPtsErr       error
 	listedProjectIDs []string
 }
 
@@ -171,13 +171,13 @@ var _ rag.HybridSearcher = (*mockProvider)(nil)
 // --- Mock Reranker ---
 
 type mockReranker struct {
-	mu           sync.Mutex
-	calls        int
-	lastQuery    string
-	lastDocs     []string
-	lastTopK     int
-	rerankErr    error
-	hits         []rag.RerankHit
+	mu        sync.Mutex
+	calls     int
+	lastQuery string
+	lastDocs  []string
+	lastTopK  int
+	rerankErr error
+	hits      []rag.RerankHit
 }
 
 func (m *mockReranker) Rerank(ctx context.Context, query string, docs []string, topK int) ([]rag.RerankHit, error) {
@@ -819,8 +819,9 @@ func TestServiceEventsAccessor(t *testing.T) {
 	ch := bus.Subscribe()
 	defer bus.Unsubscribe(ch)
 
-	// Trigger an event via CreateProject
-	_ = svc.CreateProject(context.Background(), "proj1")
+	// Trigger an event via CreateProject (a new project: the mock already
+	// lists proj1 and proj2, and existing projects publish nothing).
+	_ = svc.CreateProject(context.Background(), "proj-new")
 
 	select {
 	case ev := <-ch:
@@ -1048,8 +1049,12 @@ type mockProviderNonHybrid struct {
 	searchCalls int
 }
 
-func (m *mockProviderNonHybrid) CreateCollection(ctx context.Context, projectID string) error { return nil }
-func (m *mockProviderNonHybrid) DeleteCollection(ctx context.Context, projectID string) error { return nil }
+func (m *mockProviderNonHybrid) CreateCollection(ctx context.Context, projectID string) error {
+	return nil
+}
+func (m *mockProviderNonHybrid) DeleteCollection(ctx context.Context, projectID string) error {
+	return nil
+}
 func (m *mockProviderNonHybrid) Index(ctx context.Context, projectID string, docs []rag.Document) error {
 	return nil
 }

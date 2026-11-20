@@ -1,0 +1,82 @@
+# docker-compose.vps.yml — enowx-rag on a VPS: PostgreSQL + pgvector for
+# storage, enowx-rag for the dashboard, the API and MCP at /mcp, and an
+# optional Caddy for HTTPS.
+#
+# Quick start (or let deploy/install-vps.sh do all of it):
+#   cp deploy/vps.env.example .env      # then fill in the values
+#   docker compose -f docker-compose.vps.yml up -d --build
+#   docker compose -f docker-compose.vps.yml --profile https up -d --build   # with HTTPS (ENOWX_DOMAIN)
+#
+# Then open the dashboard, log in with RAG_ADMIN_TOKEN, and on each machine
+# where you code run:
+#   enowx-rag connect --remote https://your-domain --token <RAG_ADMIN_TOKEN>
+#   enowx-rag push    --remote https://your-domain --token <RAG_ADMIN_TOKEN>   # bring existing local memory
+
+name: enowx-rag
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: enowx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: enowxrag
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    # Not published: only enowx-rag talks to it, over the compose network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enowx -d enowxrag"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  enowx-rag:
+    build:
+      context: ./mcp-server
+      args:
+        WEB: ${ENOWX_WEB_BUILD:-build}
+    image: enowx-rag:local
+    init: true
+    environment:
+      RAG_VECTOR_STORE: pgvector
+      RAG_PGVECTOR_DSN: postgres://enowx:${POSTGRES_PASSWORD}@postgres:5432/enowxrag?sslmode=disable
+      RAG_EMBEDDER: voyage
+      # Required: the dashboard, the API and MCP all need it.
+      RAG_ADMIN_TOKEN: ${RAG_ADMIN_TOKEN:?set RAG_ADMIN_TOKEN in .env}
+      # Optional here: leave empty and set the key (and pick the Voyage models)
+      # in the dashboard — it is then kept in /data/.enowx-rag/config.yaml.
+      # Anything set here is locked in the dashboard.
+      RAG_VOYAGE_API_KEY: ${RAG_VOYAGE_API_KEY:-}
+    volumes:
+      - enowx-data:/data
+    ports:
+      # 127.0.0.1 when Caddy (or another proxy) serves HTTPS in front;
+      # 0.0.0.0 to reach http://SERVER-IP:7777 directly.
+      - "${ENOWX_BIND:-127.0.0.1}:${ENOWX_PORT:-7777}:7777"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # HTTPS with automatic Let's Encrypt certificates: needs a DNS name pointing
+  # at this server (ENOWX_DOMAIN) and ports 80/443 open.
+  caddy:
+    profiles: ["https"]
+    image: caddy:2-alpine
+    command: caddy reverse-proxy --from ${ENOWX_DOMAIN:-localhost} --to enowx-rag:7777
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - enowx-rag
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  enowx-data:
+  caddy-data:
+  caddy-config:

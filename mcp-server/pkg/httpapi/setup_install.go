@@ -1,10 +1,10 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/config"
 )
@@ -19,6 +19,24 @@ func mcpServerEntry(remoteURL, token string) (mcpEntry, error) {
 	if remoteURL != "" {
 		return mcpEntry{RemoteURL: remoteURL, Token: token}, nil
 	}
+	return localServerEntry()
+}
+
+// clientModeEntry is the stdio entry for a machine that indexes its local
+// folders into the enowx-rag server at serverURL (client mode).
+func clientModeEntry(command, serverURL, token string) mcpEntry {
+	if command == "" {
+		command = "enowx-rag"
+	}
+	env := map[string]string{"RAG_VECTOR_STORE": "remote", "RAG_REMOTE_URL": serverURL}
+	if token != "" {
+		env["RAG_REMOTE_TOKEN"] = token
+	}
+	return mcpEntry{Command: command, Env: env}
+}
+
+// localServerEntry is the stdio entry running this binary with the saved config.
+func localServerEntry() (mcpEntry, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return mcpEntry{}, fmt.Errorf("resolve binary path: %w", err)
@@ -74,58 +92,6 @@ func mcpServerEntry(remoteURL, token string) (mcpEntry, error) {
 	return mcpEntry{Command: exe, Env: env}, nil
 }
 
-// SetupInstallMCP handles POST /api/setup/install-mcp.
-// It writes (merging, with a .bak backup) the enowx-rag MCP server into the
-// selected client's config file. Body: {client_id, scope, project_dir?}.
-func (h *Handlers) SetupInstallMCP(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ClientID   string `json:"client_id"`
-		Scope      string `json:"scope"`       // "global" (default) or "project"
-		ProjectDir string `json:"project_dir"` // required for scope=project
-		Mode       string `json:"mode"`        // "local" (default) or "remote"
-		RemoteURL  string `json:"remote_url"`  // required for mode=remote
-		Token      string `json:"token"`       // optional bearer for remote
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	client, ok := mcpClientByID(req.ClientID)
-	if !ok {
-		writeErr(w, http.StatusBadRequest, "unknown client_id")
-		return
-	}
-	scope := req.Scope
-	if scope == "" {
-		scope = "global"
-	}
-	if req.Mode == "remote" && req.RemoteURL == "" {
-		writeErr(w, http.StatusBadRequest, "remote_url is required for mode=remote")
-		return
-	}
-	path, err := client.resolvePath(scope, req.ProjectDir)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	entry, err := mcpServerEntry(req.RemoteURL, req.Token)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	backedUp, err := client.install(path, entry)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, fmt.Sprintf("install failed: %v", err))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":    "installed",
-		"client":    client.Label,
-		"path":      path,
-		"backed_up": backedUp,
-	})
-}
-
 // SetupMCPSnippet handles GET /api/setup/mcp-snippet?client_id=...
 // It returns the config file path and a ready-to-paste snippet, without writing
 // anything. Used for the manual tab and unknown ("Other") clients.
@@ -138,14 +104,31 @@ func (h *Handlers) SetupMCPSnippet(w http.ResponseWriter, r *http.Request) {
 	}
 	// mode=remote&remote_url=...&token=... produces a remote (url + headers)
 	// snippet; otherwise a local stdio snippet.
+	// mode=client produces a client-mode stdio entry pointing at this server
+	// (server_url defaults to the URL the request came in on).
 	remoteURL := r.URL.Query().Get("remote_url")
-	if r.URL.Query().Get("mode") == "remote" && remoteURL == "" {
-		remoteURL = "https://YOUR-DAEMON-HOST/mcp" // placeholder so users see the shape
-	}
-	entry, err := mcpServerEntry(remoteURL, r.URL.Query().Get("token"))
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
+	var entry mcpEntry
+	switch r.URL.Query().Get("mode") {
+	case "client":
+		server := r.URL.Query().Get("server_url")
+		if server == "" {
+			server = requestBase(r)
+		}
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			token = "YOUR-ADMIN-TOKEN"
+		}
+		entry = clientModeEntry("enowx-rag", server, token)
+	default:
+		if r.URL.Query().Get("mode") == "remote" && remoteURL == "" {
+			remoteURL = requestBase(r) + "/mcp"
+		}
+		var err error
+		entry, err = mcpServerEntry(remoteURL, r.URL.Query().Get("token"))
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	path, content := client.snippet(entry)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -154,29 +137,6 @@ func (h *Handlers) SetupMCPSnippet(w http.ResponseWriter, r *http.Request) {
 		"format":  string(client.Format),
 		"content": content,
 	})
-}
-
-// SetupClients handles GET /api/setup/clients.
-// Returns the list of supported clients (id, label, scopes) for the wizard UI.
-func (h *Handlers) SetupClients(w http.ResponseWriter, r *http.Request) {
-	type clientInfo struct {
-		ID           string `json:"id"`
-		Label        string `json:"label"`
-		Format       string `json:"format"`
-		HasProject   bool   `json:"has_project"`
-		GlobalPath   string `json:"global_path"`
-	}
-	out := make([]clientInfo, 0, len(mcpClients))
-	for _, c := range mcpClients {
-		out = append(out, clientInfo{
-			ID:         c.ID,
-			Label:      c.Label,
-			Format:     string(c.Format),
-			HasProject: c.ProjectPath != "",
-			GlobalPath: c.GlobalPath,
-		})
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 // SetupSkillGuide handles GET /api/setup/skill-guide.
@@ -199,4 +159,56 @@ func (h *Handlers) SetupSkillGuide(w http.ResponseWriter, r *http.Request) {
 			"cp /path/to/enowx-rag/skill/enowx-rag.md ~/.claude/skills/enowx-rag/skill.md",
 		},
 	})
+}
+
+// ClientInfo describes an MCP client the connect command can configure.
+type ClientInfo struct {
+	ID         string
+	Label      string
+	Present    bool   // its config file or folder exists: the client is used here
+	HasEnowx   bool   // its config already has an enowx-rag entry
+	GlobalPath string // the config file a global install writes
+}
+
+// MCPClients lists the MCP clients enowx-rag knows how to configure.
+func MCPClients() []ClientInfo {
+	out := make([]ClientInfo, 0, len(mcpClients))
+	for _, c := range mcpClients {
+		path, _ := c.resolvePath("global", "")
+		present := false
+		if _, err := os.Stat(path); err == nil {
+			present = true
+		} else if _, err := os.Stat(filepath.Dir(path)); err == nil && filepath.Dir(path) != filepath.Dir(expandHome("~/x")) {
+			present = true // e.g. ~/.cursor exists, mcp.json not yet
+		}
+		out = append(out, ClientInfo{ID: c.ID, Label: c.Label, Present: present, HasEnowx: c.isInstalled(), GlobalPath: path})
+	}
+	return out
+}
+
+// InstallClientMode writes a client-mode enowx-rag entry (command, with
+// RAG_VECTOR_STORE=remote pointing at serverURL) into a client's global MCP
+// config, merging with what is there and keeping a .bak of the old file.
+func InstallClientMode(clientID, command, serverURL, token string) (path string, backedUp bool, err error) {
+	c, ok := mcpClientByID(clientID)
+	if !ok {
+		return "", false, fmt.Errorf("unknown client %q", clientID)
+	}
+	path, err = c.resolvePath("global", "")
+	if err != nil {
+		return "", false, err
+	}
+	backedUp, err = c.install(path, clientModeEntry(command, serverURL, token))
+	return path, backedUp, err
+}
+
+// ClientModeSnippet is the config text to paste into a client's MCP config by
+// hand, and where it goes.
+func ClientModeSnippet(clientID, command, serverURL, token string) (path, content string, err error) {
+	c, ok := mcpClientByID(clientID)
+	if !ok {
+		return "", "", fmt.Errorf("unknown client %q", clientID)
+	}
+	path, content = c.snippet(clientModeEntry(command, serverURL, token))
+	return path, content, nil
 }

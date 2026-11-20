@@ -41,6 +41,8 @@ Walk the user through installing the `enowx-rag` MCP server and optionally deplo
    - Provide the MCP client config snippet for all supported tools using the correct format per tool.
 
 4. **Optional server deployment**
+   - **Already have an enowx-rag server?** (URL + admin token) Skip steps 1–3: install the binary (`curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/install.sh | sh`), run `enowx-rag connect --remote <URL> --token <TOKEN>` (client mode: this machine chunks, the server embeds and stores), and `enowx-rag push --remote <URL> --token <TOKEN>` to bring existing local memory. Never write the token into the project.
+   - **New server on a VPS:** `curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/deploy/install-vps.sh | sudo sh` (PostgreSQL + pgvector, generated token, optional HTTPS with `ENOWX_DOMAIN`); the dashboard's setup wizard then asks only for the Voyage models.
    - If the user wants the backend on a server (e.g. Coolify), use that platform's tools if available (such as a `coolify` MCP server) to create/update the services.
    - Reuse an existing Qdrant + TEI service the user already runs if it is healthy and matches the requirements.
 

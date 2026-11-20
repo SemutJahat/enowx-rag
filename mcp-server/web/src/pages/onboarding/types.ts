@@ -1,19 +1,21 @@
 // Shared types for the onboarding wizard.
 
-export type VectorStoreProvider = 'pgvector' | 'qdrant' | 'chroma'
+import type { DetectResponse, ModelsResponse, SetupApplyRequest, SetupStatus } from '../../lib/api'
+
 export type EmbedderProvider = 'voyage' | 'tei' | 'openai'
 
-/** Draft configuration that the wizard collects across all steps. */
+/** Draft configuration collected across the wizard steps. */
 export interface DraftConfig {
-  vectorStore: VectorStoreProvider | ''
+  /** Set once the draft has been pre-filled from /api/setup/detect. */
+  prefilled: boolean
+  vectorStore: string // 'pgvector' | 'sqlite' (or another type detected from the environment)
   pgvectorDSN: string
-  qdrantURL: string
-  qdrantAPIKey: string
-  chromaURL: string
-  embedder: EmbedderProvider | ''
+  sqlitePath: string
+  embedder: EmbedderProvider
   voyageAPIKey: string
   voyageModel: string
   voyageDim: number
+  rerankerModel: string // "" = off
   teiURL: string
   openaiAPIKey: string
   openaiModel: string
@@ -22,15 +24,15 @@ export interface DraftConfig {
 }
 
 export const defaultDraft: DraftConfig = {
-  vectorStore: '',
-  pgvectorDSN: 'postgresql://enowdev@localhost:5432/enowxrag',
-  qdrantURL: 'http://localhost:6333',
-  qdrantAPIKey: '',
-  chromaURL: 'http://localhost:8000',
-  embedder: '',
+  prefilled: false,
+  vectorStore: 'pgvector',
+  pgvectorDSN: '',
+  sqlitePath: '',
+  embedder: 'voyage',
   voyageAPIKey: '',
   voyageModel: 'voyage-4',
   voyageDim: 1024,
+  rerankerModel: 'rerank-3',
   teiURL: 'http://localhost:8081',
   openaiAPIKey: '',
   openaiModel: 'text-embedding-3-small',
@@ -38,122 +40,103 @@ export const defaultDraft: DraftConfig = {
   openaiDim: 0,
 }
 
-export const STEPS = ['welcome', 'vector', 'embedding', 'test', 'setup', 'install', 'done'] as const
+/** Keys never written to localStorage. */
+export const SECRET_FIELDS: (keyof DraftConfig)[] = ['voyageAPIKey', 'openaiAPIKey', 'pgvectorDSN']
+
+export const STEPS = ['welcome', 'database', 'models', 'review', 'connect', 'done'] as const
 export type Step = (typeof STEPS)[number]
 
 export const STEP_LABELS: Record<Step, string> = {
   welcome: 'Welcome',
-  vector: 'Vector Store',
-  embedding: 'Embedding',
-  test: 'Test',
-  setup: 'Local Backend',
-  install: 'Install',
+  database: 'Database',
+  models: 'Models',
+  review: 'Review & apply',
+  connect: 'Connect',
   done: 'Done',
 }
 
-/** Convert DraftConfig to the flat JSON format the backend expects. */
-export function draftToRequest(cfg: DraftConfig): import('../../lib/api').SetupApplyRequest {
-  return {
-    vector_store: cfg.vectorStore,
-    embedder: cfg.embedder,
-    voyage_api_key: cfg.embedder === 'voyage' ? cfg.voyageAPIKey : undefined,
-    voyage_model: cfg.embedder === 'voyage' ? cfg.voyageModel : undefined,
-    voyage_dim: cfg.embedder === 'voyage' ? cfg.voyageDim : undefined,
-    openai_api_key: cfg.embedder === 'openai' ? cfg.openaiAPIKey : undefined,
-    openai_model: cfg.embedder === 'openai' ? cfg.openaiModel : undefined,
-    openai_base_url: cfg.embedder === 'openai' ? cfg.openaiBaseURL : undefined,
-    openai_dim: cfg.embedder === 'openai' ? cfg.openaiDim : undefined,
-    pgvector_dsn: cfg.vectorStore === 'pgvector' ? cfg.pgvectorDSN : undefined,
-    qdrant_url: cfg.vectorStore === 'qdrant' ? cfg.qdrantURL : undefined,
-    qdrant_api_key: cfg.vectorStore === 'qdrant' ? cfg.qdrantAPIKey : undefined,
-    chroma_url: cfg.vectorStore === 'chroma' ? cfg.chromaURL : undefined,
-    tei_url: cfg.embedder === 'tei' ? cfg.teiURL : undefined,
-  }
+/** What the server told us before the wizard started. */
+export interface WizardEnv {
+  status: SetupStatus | null
+  detect: DetectResponse | null
+  models: ModelsResponse | null
 }
 
-/** True when a URL points at the local machine (needs a local Docker service). */
-function isLocalURL(url: string): boolean {
-  return /localhost|127\.0\.0\.1|0\.0\.0\.0|::1/.test(url)
+export function envLockedSet(env: WizardEnv): Set<string> {
+  return new Set(env.status?.env_locked || [])
+}
+
+/** The store is fixed by the environment (and reachable): nothing to choose. */
+export function storeFromEnv(env: WizardEnv): boolean {
+  return !!env.detect?.store.from_env || envLockedSet(env).has('vector_store')
+}
+
+export function voyageKeyAvailable(env: WizardEnv, cfg: DraftConfig): boolean {
+  return !!cfg.voyageAPIKey.trim() || !!env.detect?.voyage_key_from_env || !!env.detect?.voyage_key_set
+}
+
+/** Everything needed is already provided by the environment. */
+export function fullyFromEnv(env: WizardEnv): boolean {
+  const d = env.detect
+  return !!d && d.store.ok && storeFromEnv(env) && d.voyage_key_from_env
+}
+
+/** Pre-fill a draft from the detection result. */
+export function prefill(cfg: DraftConfig, env: WizardEnv): DraftConfig {
+  const d = env.detect
+  if (!d) return cfg
+  const s = d.suggested
+  return {
+    ...cfg,
+    prefilled: true,
+    vectorStore: storeFromEnv(env) ? d.store.type : s.vector_store || cfg.vectorStore,
+    embedder: s.embedder || 'voyage',
+    voyageModel: s.voyage_model || cfg.voyageModel,
+    voyageDim: s.voyage_dim || cfg.voyageDim,
+    rerankerModel: s.reranker_model ?? cfg.rerankerModel,
+    sqlitePath: cfg.sqlitePath || d.sqlite_store?.path || '',
+  }
 }
 
 /**
- * Returns the docker-compose service names that must actually run locally for
- * this config. A remote vector store (e.g. hosted Qdrant) or an API embedder
- * (Voyage) needs no container, so it is omitted. When the result is empty,
- * nothing needs Docker and the Local Backend step can be skipped.
+ * Convert the draft into the flat JSON the backend expects. Settings fixed by
+ * environment variables are left out (except vector_store / embedder, which
+ * the endpoint requires), and empty secrets are omitted so saved or
+ * environment keys stay in place.
  */
-export function localServices(cfg: DraftConfig): string[] {
-  const names: string[] = []
-  if (cfg.vectorStore === 'pgvector' && isLocalURL(cfg.pgvectorDSN)) names.push('postgres')
-  if (cfg.vectorStore === 'qdrant' && isLocalURL(cfg.qdrantURL)) names.push('qdrant')
-  if (cfg.vectorStore === 'chroma' && isLocalURL(cfg.chromaURL)) names.push('chroma')
-  // Voyage is a cloud API — never needs Docker. Only self-hosted TEI does.
-  if (cfg.embedder === 'tei' && isLocalURL(cfg.teiURL)) names.push('tei-embedding')
-  return names
-}
-
-const SERVICE_BLOCKS: Record<string, string> = {
-  postgres: `  postgres:
-    image: pgvector/pgvector:pg16
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: enowxrag
-      POSTGRES_USER: enowdev
-    volumes:
-      - pgdata:/var/lib/postgresql/data`,
-  qdrant: `  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage`,
-  chroma: `  chroma:
-    image: chromadb/chroma:latest
-    ports:
-      - "8000:8000"
-    volumes:
-      - chroma_data:/chroma/chroma`,
-  'tei-embedding': `  tei-embedding:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
-    ports:
-      - "8081:80"
-    volumes:
-      - tei_data:/data`,
-}
-
-const SERVICE_VOLUMES: Record<string, string> = {
-  postgres: '  pgdata:',
-  qdrant: '  qdrant_data:',
-  chroma: '  chroma_data:',
-  'tei-embedding': '  tei_data:',
-}
-
-/** Generate docker-compose YAML for only the services that run locally. */
-export function generateDockerCompose(cfg: DraftConfig): string {
-  const names = localServices(cfg)
-  const services = names.map((n) => SERVICE_BLOCKS[n])
-  const volumes = names.map((n) => SERVICE_VOLUMES[n])
-  return `version: "3.9"\n\nservices:\n${services.join('\n\n')}\n${volumes.length > 0 ? `\nvolumes:\n${volumes.join('\n')}` : ''}`
-}
-
-/** Generate shell commands to start the local backend. */
-export function generateCommands(cfg: DraftConfig): string {
-  const names = localServices(cfg)
-  const lines: string[] = ['# Start local backend']
-  lines.push(`docker compose up -d ${names.join(' ')}`)
-
-  if (names.includes('postgres')) {
-    lines.push('')
-    lines.push('# Verify pgvector extension')
-    lines.push('psql -h localhost -U enowdev -d enowxrag \\')
-    lines.push('  -c "CREATE EXTENSION IF NOT EXISTS vector;"')
+export function draftToRequest(cfg: DraftConfig, env: WizardEnv): SetupApplyRequest {
+  const locked = envLockedSet(env)
+  const fromEnvStore = storeFromEnv(env)
+  const keep = (key: string) => !locked.has(key)
+  const req: SetupApplyRequest = {
+    vector_store: fromEnvStore && env.detect ? env.detect.store.type : cfg.vectorStore,
+    embedder: cfg.embedder,
   }
+  if (!fromEnvStore) {
+    if (cfg.vectorStore === 'pgvector' && cfg.pgvectorDSN.trim() && keep('pgvector_dsn')) req.pgvector_dsn = cfg.pgvectorDSN.trim()
+    if (cfg.vectorStore === 'sqlite' && cfg.sqlitePath.trim() && keep('sqlite_path')) req.sqlite_path = cfg.sqlitePath.trim()
+  }
+  if (cfg.embedder === 'voyage') {
+    if (cfg.voyageAPIKey.trim() && keep('voyage_api_key')) req.voyage_api_key = cfg.voyageAPIKey.trim()
+    if (keep('voyage_model')) req.voyage_model = cfg.voyageModel
+    if (keep('voyage_dim')) req.voyage_dim = cfg.voyageDim
+  }
+  if (cfg.embedder === 'openai') {
+    if (cfg.openaiAPIKey.trim()) req.openai_api_key = cfg.openaiAPIKey.trim()
+    req.openai_model = cfg.openaiModel
+    req.openai_base_url = cfg.openaiBaseURL
+    req.openai_dim = cfg.openaiDim
+  }
+  if (cfg.embedder === 'tei') req.tei_url = cfg.teiURL
+  // The reranker is a Voyage model; it works with any embedder as long as a Voyage key exists.
+  if (keep('reranker_model')) req.reranker_model = cfg.embedder === 'voyage' || voyageKeyAvailable(env, cfg) ? cfg.rerankerModel : ''
+  return req
+}
 
-  lines.push('')
-  lines.push('# Start enowx-rag server')
-  lines.push('./enowx-rag --serve --addr :7777')
-
-  return lines.join('\n')
+export interface StepProps {
+  cfg: DraftConfig
+  updateCfg: (patch: Partial<DraftConfig>) => void
+  env: WizardEnv
+  onBack: () => void
+  onNext: () => void
 }
