@@ -254,6 +254,10 @@ reads and chunks files (honoring `.gitignore`, never sending secrets), the
 server embeds, stores, reranks and records metrics. No Voyage key or database on
 the machine.
 
+Quit the Claude desktop app before connecting it. While it runs it writes its
+own copy of `claude_desktop_config.json` back over the file, so `connect` skips
+Claude Desktop then and prints the command to run once the app is closed.
+
 ### Bring existing memory (SQLite → pgvector)
 
 ```bash

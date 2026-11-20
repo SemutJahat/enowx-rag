@@ -257,6 +257,15 @@ are merged, with a .bak backup.
 	}
 
 	failed := 0
+	rerun := fmt.Sprintf("enowx-rag connect --remote %s --token <TOKEN> --client claude-desktop", base)
+	targets, warn := withoutRunningDesktop(targets, claudeDesktopRunning(), rerun)
+	if warn != "" {
+		fmt.Fprint(os.Stderr, warn)
+		failed++
+		if len(targets) == 0 {
+			return 1
+		}
+	}
 	for _, c := range targets {
 		path, backedUp, err := httpapi.InstallClientMode(c.ID, exe, base, token)
 		if err != nil {

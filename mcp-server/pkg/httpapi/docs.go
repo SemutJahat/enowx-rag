@@ -280,6 +280,7 @@ In client mode your machine keeps doing what only it can do (reading the project
 - Configures every MCP client it finds; `+"`"+`--client claude-code,cursor`+"`"+` picks them, `+"`"+`--print`+"`"+` only prints the config to paste.
 - Merges into existing config files and keeps a `+"`"+`.bak`+"`"+` copy.
 - Checks the URL and token first and says what's wrong (unreachable, bad token).
+- Skips Claude Desktop while the Claude app runs: the app writes its own copy of `+"`"+`claude_desktop_config.json`+"`"+` back over the file, so the change would be undone. Quit the app, then run `+"`"+`connect`+"`"+` with `+"`"+`--client claude-desktop`+"`"+` from a terminal outside it.
 
 The config it writes runs the local binary with:
 

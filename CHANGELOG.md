@@ -95,6 +95,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size a store stamps on the points it writes now.
 
 ### Fixed
+- **`connect` and a running Claude app**: the Claude desktop app keeps its
+  config in memory and writes it back while it runs, so the entry `connect`
+  wrote was undone and the app went on starting the old command. `connect` now
+  skips Claude Desktop while the app runs (macOS and Windows), configures the
+  other clients, exits 1, and prints the command to run once the app is closed.
 - **Client mode kept a local database**: a machine in client mode still opened
   `~/.enowx-rag/metrics.db`, although the server records metrics. It now keeps
   them in memory, so a client machine has no database, only
