@@ -22,6 +22,11 @@ type QueryComposition struct {
 	DenseCount   int  `json:"dense_count"`   // results that appeared in the dense ranking
 	LexicalCount int  `json:"lexical_count"` // results that appeared in the lexical ranking
 	RerankMoved  int  `json:"rerank_moved"`  // results whose position changed after rerank
+
+	// Who asked what, for the dashboard's recent-queries and per-project views.
+	Project string `json:"project,omitempty"`
+	Query   string `json:"query,omitempty"`  // truncated to maxQueryText
+	Client  string `json:"client,omitempty"` // client host / transport (see WithClient)
 }
 
 // Metrics holds in-memory, always-on query metrics. Safe for concurrent use.

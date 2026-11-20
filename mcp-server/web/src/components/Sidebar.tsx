@@ -1,115 +1,93 @@
-import { useEffect, useState, useCallback } from 'react'
-import { LayoutGrid, Search, List, Settings, ArrowRightLeft, BookOpen, KeyRound } from 'lucide-react'
-import type { Page, ProjectInfo } from '../App'
-import { api } from '../lib/api'
-import { useEvents } from '../lib/sse'
+import { LayoutGrid, List, Upload, Plug, BookOpen, Settings as SettingsIcon, X } from 'lucide-react'
+import { PAGE_LABELS, type Page } from '../App'
+import type { ProjectSummary } from '../lib/api'
+import { formatCompact } from '../lib/format'
+import { useServerStatus } from '../lib/server'
+import { Brand } from './Login'
 
 interface SidebarProps {
   page: Page
   onNavigate: (p: Page) => void
-  projects: ProjectInfo[]
+  projects: ProjectSummary[]
   activeProject: string
   onSelectProject: (id: string) => void
-  onProjectsLoaded: (projs: ProjectInfo[]) => void
+  /** Drawer state on narrow screens. */
+  open: boolean
+  onClose: () => void
 }
 
-const navItems: { label: string; page: Page; icon: typeof LayoutGrid }[] = [
-  { label: 'Overview', page: 'overview', icon: LayoutGrid },
-  { label: 'Playground', page: 'playground', icon: Search },
-  { label: 'Chunks', page: 'chunks', icon: List },
-  { label: 'Migration', page: 'migration', icon: ArrowRightLeft },
-  { label: 'Docs', page: 'docs', icon: BookOpen },
-  { label: 'Settings', page: 'settings', icon: KeyRound },
-  { label: 'Setup', page: 'setup', icon: Settings },
+const navItems: { page: Page; icon: typeof LayoutGrid }[] = [
+  { page: 'overview', icon: LayoutGrid },
+  { page: 'chunks', icon: List },
+  { page: 'import', icon: Upload },
+  { page: 'connect', icon: Plug },
+  { page: 'docs', icon: BookOpen },
+  { page: 'settings', icon: SettingsIcon },
 ]
 
-export function Sidebar({ page, onNavigate, projects, activeProject, onSelectProject, onProjectsLoaded }: SidebarProps) {
-  const [localProjects, setLocalProjects] = useState<ProjectInfo[]>(projects)
-  const { events } = useEvents()
-
-  const fetchProjects = useCallback(() => {
-    api.listProjects().then((stats) => {
-      const projs: ProjectInfo[] = stats.map((s) => ({ projectID: s.project_id, chunkCount: s.chunk_count }))
-      setLocalProjects(projs)
-      onProjectsLoaded(projs)
-    }).catch(() => {
-      // API unavailable: show an empty project list rather than fabricated data.
-      setLocalProjects([])
-      onProjectsLoaded([])
-    })
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    let cancelled = false
-    api.listProjects().then((stats) => {
-      if (cancelled) return
-      const projs: ProjectInfo[] = stats.map((s) => ({ projectID: s.project_id, chunkCount: s.chunk_count }))
-      setLocalProjects(projs)
-      onProjectsLoaded(projs)
-    }).catch(() => {
-      if (cancelled) return
-      // API unavailable: show an empty project list rather than fabricated data.
-      setLocalProjects([])
-      onProjectsLoaded([])
-    })
-    return () => { cancelled = true }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  // VAL-CROSS-011, VAL-CROSS-012: Refresh project list when SSE events
-  // indicate a change in projects or chunk counts.
-  useEffect(() => {
-    if (events.length === 0) return
-    const latest = events[0]
-    if (latest.type === 'index_completed' || latest.type === 'project_deleted' || latest.type === 'project_created' || latest.type === 'points_deleted' || latest.type === 'documents_indexed' || latest.type === 'migration_completed') {
-      fetchProjects()
-    }
-  }, [events, fetchProjects])
-
-  const displayProjects = localProjects.length > 0 ? localProjects : projects
-
+export function Sidebar({ page, onNavigate, projects, activeProject, onSelectProject, open, onClose }: SidebarProps) {
+  const { health } = useServerStatus()
   return (
-    <aside className="sidebar">
-      <div className="brand">
-        <div className="brand-mark">
-          <img className="brand-img brand-img-light" src="/icon-light-512.png" alt="enowx-rag" />
-          <img className="brand-img brand-img-dark" src="/icon-dark-512.png" alt="" aria-hidden="true" />
+    <>
+      {open && <div className="nav-backdrop" onClick={onClose} />}
+      <aside className={`sidebar ${open ? 'open' : ''}`}>
+        <div className="sidebar-top">
+          <Brand />
+          <button className="icon-btn nav-close" onClick={onClose} title="Close menu">
+            <X size={15} />
+          </button>
         </div>
-        <div className="brand-name">enowx<span>·rag</span></div>
-      </div>
 
-      {navItems.map((item) => {
-        const Icon = item.icon
-        return (
-          <div
-            key={item.page}
-            className={`nav-item ${page === item.page ? 'active' : ''}`}
-            onClick={() => onNavigate(item.page)}
-          >
-            <Icon size={15} strokeWidth={1.6} />
-            {item.label}
-          </div>
-        )
-      })}
+        <nav>
+          {navItems.map((item) => {
+            const Icon = item.icon
+            return (
+              <button
+                type="button"
+                key={item.page}
+                className={`nav-item ${page === item.page ? 'active' : ''}`}
+                onClick={() => onNavigate(item.page)}
+              >
+                <Icon size={15} strokeWidth={1.6} />
+                {PAGE_LABELS[item.page]}
+              </button>
+            )
+          })}
+        </nav>
 
-      <div className="nav-label">Projects</div>
-      <div className="proj-list">
-        {displayProjects.length === 0 ? (
-          <div className="proj-empty">No projects indexed yet.</div>
-        ) : (
-          displayProjects.map((p) => (
-            <div
-              key={p.projectID}
-              className={`proj ${activeProject === p.projectID ? 'active' : ''}`}
-              onClick={() => onSelectProject(p.projectID)}
-            >
-              <span className="status-dot" style={{ background: 'var(--good)' }} />
-              <span className="proj-name mono">{p.projectID}</span>
-              <span className="count tnum">{p.chunkCount.toLocaleString()}</span>
+        <div className="nav-label">Projects</div>
+        <div className="proj-list">
+          {projects.length === 0 ? (
+            <div className="proj-empty">
+              No projects yet.{' '}
+              <button type="button" className="link-btn inline" onClick={() => onNavigate('connect')}>Connect a machine</button>
             </div>
-          ))
+          ) : (
+            projects.map((p) => (
+              <button
+                type="button"
+                key={p.project_id}
+                className={`proj ${activeProject === p.project_id ? 'active' : ''}`}
+                onClick={() => onSelectProject(p.project_id)}
+                title={`${p.project_id} — ${p.chunk_count} chunks`}
+              >
+                <span
+                  className="status-dot"
+                  style={{ background: p.sources.some((s) => s.last_sync) ? 'var(--good)' : 'var(--text-faint)' }}
+                />
+                <span className="proj-name mono">{p.project_id}</span>
+                <span className="count tnum">{formatCompact(p.chunk_count)}</span>
+              </button>
+            ))
+          )}
+        </div>
+
+        {health && (
+          <div className="sidebar-foot mono">
+            enowx-rag {health.version}
+          </div>
         )}
-      </div>
-    </aside>
+      </aside>
+    </>
   )
 }

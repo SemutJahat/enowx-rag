@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS query_metrics (
 		db.Close()
 		return nil, fmt.Errorf("create metrics schema: %w", err)
 	}
+	if err := migrateMetricsSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate metrics schema: %w", err)
+	}
 
 	return &SQLiteMetricsStore{db: db}, nil
 }
@@ -54,10 +58,11 @@ func (s *SQLiteMetricsStore) Close() error { return s.db.Close() }
 func (s *SQLiteMetricsStore) PersistQueryMetric(ctx context.Context, latencyMs float64, comp QueryComposition) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO query_metrics
-	(latency_ms, hybrid, reranked, candidates, results, dense_count, lexical_count, rerank_moved)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	(latency_ms, hybrid, reranked, candidates, results, dense_count, lexical_count, rerank_moved, project, query, client)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		latencyMs, b2i(comp.Hybrid), b2i(comp.Reranked), comp.Candidates,
-		comp.Results, comp.DenseCount, comp.LexicalCount, comp.RerankMoved)
+		comp.Results, comp.DenseCount, comp.LexicalCount, comp.RerankMoved,
+		comp.Project, comp.Query, comp.Client)
 	return err
 }
 

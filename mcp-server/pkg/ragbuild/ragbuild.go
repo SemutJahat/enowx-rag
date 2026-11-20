@@ -15,7 +15,7 @@ import (
 
 // Spec fully describes one provider + embedder to build.
 type Spec struct {
-	VectorStore string // "sqlite" | "qdrant" | "chroma" | "pgvector"
+	VectorStore string // "sqlite" | "qdrant" | "chroma" | "pgvector" | "remote"
 	Embedder    string // "voyage" | "openai" | "tei"
 
 	// Vector store connection.
@@ -35,6 +35,15 @@ type Spec struct {
 	OpenAIBaseURL string
 	OpenAIDim     int
 	TEIURL        string
+
+	// Client mode (VectorStore "remote"): the enowx-rag server and its token.
+	RemoteURL   string
+	RemoteToken string
+
+	// AllowUnconfigured opens the store with a stand-in embedder when the
+	// embedder can't be built yet (e.g. no Voyage key on a fresh server): the
+	// store can be browsed, embedding calls fail with what to set.
+	AllowUnconfigured bool
 }
 
 // BuildEmbedder constructs the embedding client described by the spec.
@@ -44,7 +53,7 @@ func BuildEmbedder(spec Spec) (rag.EmbeddingClient, error) {
 		return rag.NewTEIEmbeddingClient(spec.TEIURL), nil
 	case "voyage":
 		if spec.VoyageAPIKey == "" {
-			return nil, fmt.Errorf("voyage_api_key is required for the voyage embedder")
+			return nil, fmt.Errorf("the Voyage API key is not set (voyage.api_key / RAG_VOYAGE_API_KEY)")
 		}
 		return rag.NewVoyageEmbeddingClient(spec.VoyageAPIKey, spec.VoyageModel, spec.VoyageDim), nil
 	case "openai":
@@ -60,9 +69,16 @@ func BuildEmbedder(spec Spec) (rag.EmbeddingClient, error) {
 // BuildProvider constructs the vector-store provider described by the spec,
 // wiring in the embedder.
 func BuildProvider(ctx context.Context, spec Spec) (rag.Provider, error) {
+	if strings.EqualFold(spec.VectorStore, "remote") {
+		return rag.NewRemoteProvider(ctx, spec.RemoteURL, spec.RemoteToken)
+	}
 	embedder, err := BuildEmbedder(spec)
 	if err != nil {
-		return nil, err
+		if !spec.AllowUnconfigured {
+			return nil, err
+		}
+		embedder = &rag.UnconfiguredEmbedder{Model: spec.VoyageModel, Dim: spec.VoyageDim,
+			Reason: err.Error() + " — add it in the dashboard (Setup or Settings → API keys) or set RAG_VOYAGE_API_KEY"}
 	}
 	switch strings.ToLower(spec.VectorStore) {
 	case "sqlite":

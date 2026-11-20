@@ -2,7 +2,10 @@
 // The Provider interface is intentionally small: one project = one collection/index.
 package rag
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Document is a unit of content stored in a RAG collection.
 type Document struct {
@@ -174,4 +177,72 @@ type PointInfo struct {
 	DocID        string `json:"doc_id,omitempty"` // original document ID (Qdrant stores UUID, doc_id preserves the original)
 	Content      string `json:"content,omitempty"`
 	ChunkIndex   string `json:"chunk_index,omitempty"`
+}
+
+// VectorExporter is implemented by providers that can export a project's
+// points together with their stored vectors, so an import into another store
+// can reuse them instead of paying to embed the text again (only valid when
+// the destination embeds with a compatible model and the same size).
+type VectorExporter interface {
+	ExportPointsWithVectors(ctx context.Context, projectID string) ([]Document, [][]float32, error)
+}
+
+// VectorImporter is implemented by providers that can store points with
+// vectors made elsewhere (see VectorExporter). Meta must already carry the
+// embed_model / embed_dim of the vectors.
+type VectorImporter interface {
+	IndexVectors(ctx context.Context, projectID string, docs []Document, vectors [][]float32) error
+}
+
+// StoreInfo describes the running vector store for the dashboard.
+type StoreInfo struct {
+	Type             string `json:"type"`
+	Target           string `json:"target"` // where it lives, never with a password
+	ServerVersion    string `json:"server_version,omitempty"`
+	ExtensionVersion string `json:"extension_version,omitempty"`
+	Table            string `json:"table,omitempty"`
+	Dim              int    `json:"dim,omitempty"`
+	SizeBytes        int64  `json:"size_bytes,omitempty"`
+	Rows             int64  `json:"rows"`
+	ContentChars     int64  `json:"content_chars"`
+	LatencyMs        int64  `json:"latency_ms"`
+}
+
+// StoreInfoer is implemented by providers that can describe themselves.
+type StoreInfoer interface {
+	StoreInfo(ctx context.Context) (StoreInfo, error)
+}
+
+// EmbedStat counts a project's points by the embedding model and size that
+// wrote them (from their embed_model / embed_dim metadata).
+type EmbedStat struct {
+	Model string `json:"model"`
+	Dim   int    `json:"dim"`
+	Count int    `json:"count"`
+}
+
+// EmbedStatser is implemented by providers that can count points per
+// embedding model cheaply (projectID "" = every project).
+type EmbedStatser interface {
+	EmbedStats(ctx context.Context, projectID string) ([]EmbedStat, error)
+}
+
+// FileCounter is implemented by providers that can count a project's distinct
+// source files cheaply.
+type FileCounter interface {
+	CountFiles(ctx context.Context, projectID string) (int, error)
+}
+
+// DelegatedSearcher is implemented by providers that run the whole search —
+// retrieval, hybrid fusion and reranking — elsewhere (the remote client-mode
+// provider: the server searches, reranks and records metrics).
+type DelegatedSearcher interface {
+	SearchFull(ctx context.Context, projectID, query string, k, recall int, hybrid, rerank, compress bool) ([]Result, error)
+}
+
+// SyncReporter is implemented by providers that want to hear about a finished
+// directory sync (the remote provider tells the server, so its dashboard shows
+// where each project's code lives and when it last synced).
+type SyncReporter interface {
+	ReportSync(ctx context.Context, projectID, dir string, stats map[string]int, took time.Duration) error
 }

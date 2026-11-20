@@ -1,9 +1,9 @@
 package httpapi
 
 import (
-	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -21,22 +21,47 @@ type docSection struct {
 var docSections = []docSection{
 	{ID: "overview", Title: "Overview", Body: docOverview},
 	{ID: "quickstart", Title: "Quick start", Body: docQuickstart},
+	{ID: "vps", Title: "Deploy on a VPS", Body: docVPS},
+	{ID: "client-mode", Title: "Connect machines & import", Body: docClientMode},
 	{ID: "mcp-tools", Title: "MCP tools", Body: docMCPTools},
 	{ID: "api-reference", Title: "API reference", Body: docAPIReference},
-	{ID: "embedders", Title: "Embedders", Body: docEmbedders},
+	{ID: "embedders", Title: "Embedders (Voyage)", Body: docEmbedders},
 	{ID: "vector-stores", Title: "Vector stores", Body: docVectorStores},
 	{ID: "search", Title: "Search (hybrid / rerank / compress)", Body: docSearch},
-	{ID: "migration", Title: "Migration", Body: docMigration},
+	{ID: "migration", Title: "Migration (API)", Body: docMigration},
 	{ID: "metrics", Title: "Metrics", Body: docMetrics},
-	{ID: "remote", Title: "Remote / daemon", Body: docRemote},
+	{ID: "remote", Title: "MCP over HTTP", Body: docRemote},
 	{ID: "agent-setup", Title: "Agent setup", Body: docAgentSetup},
 }
 
+// requestBase is the URL clients reach this server at, for links and config
+// snippets. Behind a reverse proxy (the Caddy service in
+// docker-compose.vps.yml) the original scheme and host come from
+// X-Forwarded-Proto / X-Forwarded-Host. These only shape text shown back to
+// the same caller, never access decisions.
 func requestBase(r *http.Request) string {
+	scheme := "http"
 	if r.TLS != nil {
-		return "https://" + r.Host
+		scheme = "https"
 	}
-	return "http://" + r.Host
+	if p := strings.ToLower(firstHeaderValue(r, "X-Forwarded-Proto")); p == "http" || p == "https" {
+		scheme = p
+	}
+	host := r.Host
+	if fh := firstHeaderValue(r, "X-Forwarded-Host"); fh != "" && !strings.ContainsAny(fh, " /\\\t@") {
+		host = fh
+	}
+	return scheme + "://" + host
+}
+
+// firstHeaderValue returns the first comma-separated value of a header
+// (proxies append to X-Forwarded-* lists), trimmed.
+func firstHeaderValue(r *http.Request, name string) string {
+	v := r.Header.Get(name)
+	if i := strings.IndexByte(v, ','); i >= 0 {
+		v = v[:i]
+	}
+	return strings.TrimSpace(v)
 }
 
 // DocsList handles GET /api/docs — the documentation table of contents.
@@ -80,327 +105,480 @@ func (h *Handlers) SetupDocs(w http.ResponseWriter, r *http.Request) {
 
 // --- Section bodies ---
 
-func docOverview(base, _ string) string {
-	return `# enowx-rag
+// Bodies are markdown with placeholders: {{BASE}} (the URL clients reach this
+// server at), {{EXE}} (this binary) and {{AGENTS_BLOCK}} (the AGENTS.md block,
+// as an indented code block). The dashboard renders one paragraph per line.
+func docText(base, exe, md string) string {
+	return strings.NewReplacer(
+		"{{BASE}}", base,
+		"{{EXE}}", exe,
+		"{{AGENTS_BLOCK}}", indentBlock(agentsBlock("PROJECT_ID")),
+	).Replace(md)
+}
 
-Per-project RAG (retrieval-augmented generation) memory for AI coding agents.
-Each project gets its own vector collection, so an agent can index context about
-a codebase and retrieve it quickly and in isolation.
+func indentBlock(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = "    " + l
+	}
+	return strings.Join(lines, "\n")
+}
 
-## What it does
+func docOverview(base, exe string) string {
+	return docText(base, exe, `# enowx-rag
 
-- **Index** a project's code/text into a vector store, chunked and embedded.
-- **Retrieve** the most relevant chunks for a query (semantic, hybrid, reranked).
-- **Persist** design decisions, gotchas, and facts as per-project memory.
+Per-project RAG memory for AI coding agents. Each project gets its own collection: agents index a codebase and the decisions behind it, and retrieve the relevant parts before they code.
 
-## Two run modes (one binary)
+## Three ways to run (one binary)
 
-- **MCP stdio** (default): the agent talks to enowx-rag over the Model Context
-  Protocol. This is what you configure in Claude Code, Cursor, etc.
-- **HTTP + dashboard** (` + "`--serve`" + `): a REST API, an SSE event stream, and an
-  embedded web dashboard (Overview, Playground, Chunks, Migration, Docs, Setup).
+| Mode | How it runs | Where the work happens |
+| --- | --- | --- |
+| Local | `+"`"+`enowx-rag`+"`"+`, launched by your MCP client | everything on this machine |
+| Server | `+"`"+`enowx-rag --serve`+"`"+` (e.g. on a VPS) | dashboard, REST API and MCP at `+"`"+`/mcp`+"`"+`; embeds, stores, reranks |
+| Client | `+"`"+`enowx-rag`+"`"+` with `+"`"+`RAG_VECTOR_STORE=remote`+"`"+` (written by `+"`"+`enowx-rag connect`+"`"+`) | this machine reads and chunks files; the server embeds and stores them |
+
+The usual setup: one **server** on a VPS with PostgreSQL + pgvector, and every machine you code on in **client mode**. See *Deploy on a VPS* and *Connect machines & import*.
+
+## The dashboard
+
+The server's dashboard is for hosting and monitoring:
+
+- **Overview** — health, store, models, projects (and the machine and folder each was last synced from), running jobs, live activity.
+- **Chunks** — browse and delete a project's chunks.
+- **Import** — upload a local SQLite store (`+"`"+`rag.db`+"`"+`); its projects are converted into this server's store, vectors reused where the model matches.
+- **Connect** — the commands and config to use this server from a machine.
+- **Settings** — Voyage embedding and rerank models (live test, re-embed cost), database, auto-sync, admin token.
+- **Docs** — these pages.
 
 ## Building blocks
 
-- **Vector stores**: Qdrant, pgvector, Chroma (see *Vector stores*).
-- **Embedders**: Voyage AI, any OpenAI-compatible API, or self-hosted TEI (see
-  *Embedders*).
-- **Search**: dense, plus optional hybrid (dense + lexical RRF), reranking, and
-  near-duplicate compression (see *Search*).
-
-Start at *Quick start*, wire it into your agent via *Agent setup*, and use the
-*API reference* for automation.`
+- **Vector stores**: PostgreSQL + pgvector (recommended for a server), the built-in SQLite store (local), Qdrant, Chroma (experimental).
+- **Embedders**: Voyage AI (recommended), any OpenAI-compatible API, or self-hosted TEI.
+- **Search**: dense, hybrid (dense + lexical), Voyage reranking, near-duplicate compression.`)
 }
 
 func docQuickstart(base, exe string) string {
-	return fmt.Sprintf(`# Quick start
+	return docText(base, exe, `# Quick start
 
-## 1. Configure
+## 1. The server (VPS)
 
-Set a vector store + embedder. The fastest path is Qdrant + Voyage AI (free
-tier). Either use the **Setup** wizard in the dashboard, or set env vars:
+On a fresh Linux VPS:
 
-    RAG_VECTOR_STORE=qdrant
-    RAG_QDRANT_URL=http://localhost:6333
-    RAG_EMBEDDER=voyage
-    RAG_VOYAGE_API_KEY=pa-...
+    curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/deploy/install-vps.sh | sudo sh
 
-## 2. Run
+It installs Docker, starts PostgreSQL + pgvector and enowx-rag, generates the database password and the admin token, and prints the dashboard URL. Open it and sign in with the token: the setup wizard finds the database by itself, you pick the Voyage models (and paste the key if the installer didn't get one). Details in *Deploy on a VPS*.
 
-- MCP mode (for your agent): run the binary with no flags.
-- Dashboard: run with ` + "`--serve`" + ` and open the UI.
+## 2. Each machine you code on
 
-Binary: %s
+    curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/install.sh | sh
+    enowx-rag connect --remote {{BASE}} --token <ADMIN_TOKEN>
 
-## 3. Connect your agent
+`+"`"+`connect`+"`"+` adds enowx-rag in client mode to every MCP client it finds (Claude Code, Cursor, …); restart the client. Bring the memory this machine already has:
 
-Use **Setup → Install** in the dashboard to write the MCP config into your
-client (Claude Code, Cursor, …), or let an agent do it — see *Agent setup*.
+    enowx-rag push --remote {{BASE}} --token <ADMIN_TOKEN>
 
-## 4. Index a project
+## 3. Index a project
 
-From your agent call the ` + "`rag_index_project`" + ` MCP tool with the project
-directory, or from the API:
+Ask your agent to call `+"`"+`rag_index_project`+"`"+` once with the project folder. The folder is remembered: before a search whose index is older than `+"`"+`auto_sync_interval`+"`"+` (default 60s, `+"`"+`off`+"`"+` to disable) new and edited code is indexed and removed code is deleted.
 
-    POST %s/api/projects/<PROJECT_ID>/reindex   { "directory": "/abs/path" }
+The dashboard's **Re-index** button needs no path. It re-syncs the project's folder when this server can read it, and otherwise re-embeds the stored chunks with the current model (the code itself is synced by the machines that index it).
 
-Once indexed, the directory is remembered and re-synced automatically before
-searches whose index is older than ` + "`auto_sync_interval`" + ` in config.yaml or
-` + "`RAG_AUTO_SYNC_INTERVAL`" + ` (default 60s, ` + "`off`" + ` to disable): new and edited
-code is indexed, removed code is deleted.
+## Local only (no server)
 
-## 5. Retrieve
-
-Ask your agent to use ` + "`rag_retrieve_context`" + `, or try the **Playground** in
-the dashboard.`, exe, base)
+Let your MCP client run the binary with no flags, with `+"`"+`RAG_VECTOR_STORE=sqlite`+"`"+` (the built-in store, `+"`"+`~/.enowx-rag/rag.db`+"`"+`, no service to run) and `+"`"+`RAG_VOYAGE_API_KEY`+"`"+` in its environment. Or run `+"`"+`enowx-rag --serve`+"`"+` once and finish the setup wizard: the settings land in `+"`"+`~/.enowx-rag/config.yaml`+"`"+`, which the stdio server reads too. Binary: {{EXE}}`)
 }
 
-func docMCPTools(_, _ string) string {
-	return "# MCP tools\n\n" +
-		"enowx-rag exposes these MCP tools (over stdio or remote HTTP). Project IDs isolate " +
-		"collections.\n\n" +
-		"## Write / index\n" +
-		"## `rag_create_project`\nCreate a project collection. Input: `project_id`.\n\n" +
-		"## `rag_index`\nIndex documents you pass directly. Input: `project_id`, `documents` " +
-		"(each `{id?, content, meta?}`). Use for saving facts/decisions.\n\n" +
-		"## `rag_index_project`\nScan a directory and sync all code/text files (new and edited code " +
-		"indexed, removed code and files deleted, incrementally; honors .gitignore, skips " +
-		"node_modules/.git/vendor/dist/build and secrets). Input: `project_id`, `directory`. Run it " +
-		"once per directory: it is then re-synced automatically before searches " +
-		"(`RAG_AUTO_SYNC_INTERVAL`, default 60s). Run it again to force an immediate sync.\n\n" +
-		"## Read / search\n" +
-		"## `rag_semantic_search`\nSearch a project. Input: `project_id`, `query`, `limit`, and " +
-		"optionally `recall`, `hybrid`, `rerank`, `compress` (hybrid/rerank default on). Returns " +
-		"chunks with scores.\n\n" +
-		"## `rag_retrieve_context`\nLike search but returns a compact concatenated context string " +
-		"plus the chunks — convenient for feeding an LLM. Same options as `rag_semantic_search`.\n\n" +
-		"## Inspect / manage\n" +
-		"## `rag_list_projects`\nList all projects with chunk counts. Discover available memory " +
-		"before searching. No input.\n\n" +
-		"## `rag_project_exists`\nCheck whether a project has indexed memory. Input: `project_id`.\n\n" +
-		"## `rag_list_points`\nList chunks in a project (id, source file, preview), optionally " +
-		"filtered by `source_file`. Input: `project_id`, `source_file?`.\n\n" +
-		"## `rag_delete_points`\nDelete specific chunks by ID (remove stale entries without a full " +
-		"re-index). Input: `project_id`, `point_ids`.\n\n" +
-		"## `rag_delete_project`\nDelete a project collection and all its data. Input: `project_id`.\n\n" +
-		"## `rag_stats`\nAggregate stats: projects, total chunks, embed model, latency, tokens. No input.\n\n" +
-		"**Typical loop:** `rag_index_project` once per project directory → `rag_retrieve_context` " +
-		"before coding (file changes are synced automatically) → do the work → `rag_index` new facts " +
-		"and decisions."
+func docVPS(base, exe string) string {
+	return docText(base, exe, `# Deploy on a VPS
+
+## One command
+
+    curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/deploy/install-vps.sh | sudo sh
+
+Without questions: `+"`"+`curl -fsSL …/install-vps.sh | sudo ENOWX_DOMAIN=rag.example.com VOYAGE_API_KEY=pa-... sh`+"`"+`
+
+The installer:
+
+1. installs Docker if it's missing and clones the repo into `+"`"+`/opt/enowx-rag`+"`"+`;
+2. writes `+"`"+`/opt/enowx-rag/.env`+"`"+` (mode 600) with a random PostgreSQL password and admin token;
+3. starts `+"`"+`docker-compose.vps.yml`+"`"+`: **postgres** (pgvector, not published), **enowx-rag**, and with `+"`"+`ENOWX_DOMAIN`+"`"+` set **caddy** for HTTPS (Let's Encrypt);
+4. waits for `+"`"+`/api/health`+"`"+`, then prints the URL, the token and the commands for your machines.
+
+Re-run it to update; `+"`"+`.env`+"`"+` is kept. On a VPS with less than 2 GB of RAM it embeds the committed dashboard instead of building it with npm.
+
+## By hand
+
+    git clone https://github.com/enowdev/enowx-rag && cd enowx-rag
+    cp deploy/vps.env.example .env      # set POSTGRES_PASSWORD and RAG_ADMIN_TOKEN
+    docker compose -f docker-compose.vps.yml up -d --build
+    docker compose -f docker-compose.vps.yml --profile https up -d --build   # HTTPS (ENOWX_DOMAIN)
+
+Without Docker: run `+"`"+`enowx-rag --serve`+"`"+` under systemd (`+"`"+`deploy/enowx-rag.service`+"`"+`) with `+"`"+`RAG_VECTOR_STORE=pgvector`+"`"+`, `+"`"+`RAG_PGVECTOR_DSN`+"`"+` and `+"`"+`RAG_ADMIN_TOKEN`+"`"+` in its environment, behind your own HTTPS proxy.
+
+## Dokploy (or another Docker host with its own proxy)
+
+Dokploy runs `+"`"+`docker-compose.vps.yml`+"`"+` as a Compose service and puts its own Traefik with HTTPS in front, so the Caddy profile stays off.
+
+1. **Create Service → Compose**, provider Git or GitHub: this repository, branch `+"`"+`main`+"`"+`, compose path `+"`"+`./docker-compose.vps.yml`+"`"+`.
+2. **Environment**: `+"`"+`POSTGRES_PASSWORD`+"`"+` (letters and digits, e.g. `+"`"+`openssl rand -hex 24`+"`"+`), `+"`"+`RAG_ADMIN_TOKEN`+"`"+` (`+"`"+`openssl rand -hex 32`+"`"+`); optionally `+"`"+`RAG_VOYAGE_API_KEY`+"`"+`, `+"`"+`ENOWX_WEB_BUILD=prebuilt`+"`"+` on a small server, and `+"`"+`ENOWX_PORT`+"`"+` when 7777 is taken on the host. Keep **Create Environment File** on.
+3. **Domains**: the host name (e.g. `+"`"+`rag.example.com`+"`"+`), service `+"`"+`enowx-rag`+"`"+`, container port `+"`"+`7777`+"`"+`, HTTPS on: Let's Encrypt, or certificate provider **None** when Cloudflare connects with an origin certificate already added under Settings → Certificates.
+4. **Preview Compose**: `+"`"+`enowx-rag`+"`"+` should list both `+"`"+`dokploy-network`+"`"+` and `+"`"+`default`+"`"+` under `+"`"+`networks`+"`"+` (Dokploy v0.31 keeps the stack's own network, so it still reaches `+"`"+`postgres`+"`"+`, which stays off Dokploy's shared network). Only if it lists `+"`"+`dokploy-network`+"`"+` alone (older Dokploy) turn on **Advanced → Isolated Deployments**.
+5. **Deploy**, then open the domain: the setup wizard asks for the Voyage key and models.
+6. **Auto-deploy** (optional): turn on **Autodeploy**, then add the service's **Webhook URL** (Deployments tab) to the repository's GitHub webhooks (content type `+"`"+`application/json`+"`"+`, event *push*). Every push to the configured branch then redeploys. If the Dokploy panel's host is behind a Cloudflare IP allowlist, exempt `+"`"+`/api/deploy/`+"`"+` for GitHub's webhook ranges (`+"`"+`hooks`+"`"+` in `+"`"+`https://api.github.com/meta`+"`"+`), or GitHub gets a 403.
+
+Data lives in the named volumes `+"`"+`pg-data`+"`"+` and `+"`"+`enowx-data`+"`"+` and survives redeploys. The dashboard is also published on the host's `+"`"+`127.0.0.1:7777`+"`"+` only: not reachable from outside, handy for an SSH tunnel.
+
+## Behind Cloudflare
+
+- Proxied DNS record for the host, SSL/TLS mode **Full (strict)**, and a certificate on the server for that name (a Cloudflare Origin Certificate works).
+- Cloudflare's Free and Pro plans accept at most 100 MB per request. `+"`"+`push`+"`"+` and the dashboard's **Import** send stores in 32 MiB parts, so any size fits; a part that a proxy still refuses is split in half, and a failed part is retried.
+- Cloudflare waits at most 100 seconds for an answer. Long work (imports, re-index, re-embedding) runs as jobs that clients follow, and the live activity stream sends a heartbeat every 30 seconds.
+- Keep Bot Fight Mode, challenges and Cloudflare Access away from `+"`"+`/api`+"`"+` and `+"`"+`/mcp`+"`"+`: MCP clients and `+"`"+`push`+"`"+` can't solve them. They identify as `+"`"+`User-Agent: enowx-rag/<version>`+"`"+`, which a WAF skip rule can match.
+- When Cloudflare (or another proxy) blocks a request, `+"`"+`connect`+"`"+`, `+"`"+`push`+"`"+`, client mode and the dashboard say so, with the Ray ID, instead of calling it a bad token.
+
+## Onboarding
+
+The first visit opens the setup wizard:
+
+1. **Database** — detected from the environment (the compose file sets pgvector), with the PostgreSQL and pgvector versions; nothing to type.
+2. **Models** — Voyage embedding model and dimension, and the rerank model, with price, context length and a live test of the key.
+3. **Review & apply** — each component is tested for real; the server saves `+"`"+`config.yaml`+"`"+` and restarts itself.
+4. **Connect** — the commands for your machines.
+
+An old SQLite store (`+"`"+`rag.db`+"`"+`) in the data volume is imported into pgvector when the server starts, then renamed `+"`"+`rag.db.imported-<time>`+"`"+`.
+
+## Settings from the environment
+
+Settings given as environment variables (the compose `+"`"+`.env`+"`"+`) are read-only in the dashboard, and secrets are never written to `+"`"+`config.yaml`+"`"+`. Change them in `+"`"+`.env`+"`"+`, then `+"`"+`docker compose -f docker-compose.vps.yml up -d`+"`"+`.
+
+| Variable | Meaning |
+| --- | --- |
+| `+"`"+`RAG_ADMIN_TOKEN`+"`"+` | required; gates the dashboard, `+"`"+`/api`+"`"+` and `+"`"+`/mcp`+"`"+` |
+| `+"`"+`POSTGRES_PASSWORD`+"`"+` | database password (letters and digits; the DSN is built from it) |
+| `+"`"+`RAG_VOYAGE_API_KEY`+"`"+` | optional; otherwise set it in the dashboard |
+| `+"`"+`ENOWX_DOMAIN`+"`"+` | DNS name for HTTPS through Caddy |
+| `+"`"+`ENOWX_BIND`+"`"+`, `+"`"+`ENOWX_PORT`+"`"+` | where the dashboard port is published (127.0.0.1 behind Caddy) |
+| `+"`"+`ENOWX_WEB_BUILD`+"`"+` | `+"`"+`build`+"`"+` (npm inside Docker) or `+"`"+`prebuilt`+"`"+` (committed dashboard) |
+
+## Security
+
+- The admin token can read and delete every project: keep it secret.
+- Use HTTPS (`+"`"+`ENOWX_DOMAIN`+"`"+`) when the server is reachable from the internet; over plain HTTP the token travels in clear text.
+- Docker publishes ports past ufw/firewalld: without the HTTPS profile, restrict the port at your provider's firewall.
+- PostgreSQL is reachable only inside the compose network.`)
 }
 
-func docAPIReference(base, _ string) string {
-	return fmt.Sprintf(`# API reference
+func docClientMode(base, exe string) string {
+	return docText(base, exe, `# Connect machines & import
 
-All endpoints are under %s/api. Endpoints that write files or config are
-restricted to localhost or a valid `+"`RAG_ADMIN_TOKEN`"+` bearer token.
+## Client mode
 
-## Projects & search
-- `+"`GET /api/projects`"+` — list projects with chunk counts
-- `+"`GET /api/projects/{id}`"+` — project detail
-- `+"`GET /api/projects/{id}/points`"+` — list chunks (`+"`?source_file=&offset=&limit=`"+`)
-- `+"`DELETE /api/projects/{id}/points/{pointId}`"+` — delete one chunk
-- `+"`POST /api/projects/{id}/reindex`"+` — index a directory (`+"`{directory}`"+`)
-- `+"`DELETE /api/projects/{id}`"+` — delete a project
-- `+"`POST /api/search`"+` — search (`+"`{project_id, query, k, recall, hybrid, rerank, compress}`"+`)
+In client mode your machine keeps doing what only it can do (reading the project folder, chunking, skipping secrets and `+"`"+`.gitignore`+"`"+`d files) and sends the chunks to the server, which embeds, stores, reranks and records metrics. No Voyage key or database is needed on the machine, and the dashboard shows which machine and folder each project was last synced from.
 
-## Stats, metrics, events
-- `+"`GET /api/stats`"+` — totals + embed model
-- `+"`GET /api/metrics`"+` — latency, tokens, backend, persistence (see *Metrics*)
-- `+"`GET /api/events`"+` — SSE stream (index/search/migration events)
+    enowx-rag connect --remote {{BASE}} --token <ADMIN_TOKEN>
 
-## Setup & install
-- `+"`POST /api/setup/test`"+` — test vector store + embedder connectivity
-- `+"`POST /api/setup/apply`"+` — save config to ~/.enowx-rag/config.yaml
-- `+"`GET /api/setup/status`"+` — is config present
-- `+"`GET /api/setup/clients`"+` — supported MCP clients
-- `+"`POST /api/setup/install-mcp`"+` — write the server into a client's config (merge + backup)
-- `+"`GET /api/setup/mcp-snippet?client_id=`"+` — manual config snippet
-- `+"`GET /api/setup/skill-guide`"+` — skill install instructions
-- `+"`GET /api/setup/probe?client=&dir=`"+` — what's already installed (for idempotent setup)
-- `+"`POST /api/setup/write-agents-md`"+` — merge the enowx-rag block into AGENTS.md
-- `+"`GET /api/setup/config`"+` — current config, secrets masked
-- `+"`GET /api/setup/config/reveal`"+` — full secrets (localhost or admin token)
-- `+"`POST /api/setup/config`"+` — update keys/settings
-- `+"`POST /api/setup/gen-token`"+` — generate + save an admin token
+- Configures every MCP client it finds; `+"`"+`--client claude-code,cursor`+"`"+` picks them, `+"`"+`--print`+"`"+` only prints the config to paste.
+- Merges into existing config files and keeps a `+"`"+`.bak`+"`"+` copy.
+- Checks the URL and token first and says what's wrong (unreachable, bad token).
+- Skips Claude Desktop while the Claude app runs: the app writes its own copy of `+"`"+`claude_desktop_config.json`+"`"+` back over the file, so the change would be undone. Quit the app, then run `+"`"+`connect`+"`"+` with `+"`"+`--client claude-desktop`+"`"+` from a terminal outside it.
+
+The config it writes runs the local binary with:
+
+    RAG_VECTOR_STORE=remote
+    RAG_REMOTE_URL={{BASE}}
+    RAG_REMOTE_TOKEN=<ADMIN_TOKEN>
+
+The dashboard's **Connect** page shows the same commands and snippets per client.
+
+## Import local memory (SQLite → server)
+
+    enowx-rag push --remote {{BASE}} --token <ADMIN_TOKEN>
+
+1. Takes a consistent snapshot of `+"`"+`~/.enowx-rag/rag.db`+"`"+` (safe while agents use it).
+2. Uploads it gzip-compressed in 32 MiB parts, with progress: it fits behind Cloudflare's 100 MB request limit, and a failed part is retried.
+3. Shows the plan per project: chunks, and how many keep their vectors.
+4. Imports into the server's store as a job and follows it.
+5. Tells the server where each project's folder is, so auto-sync carries on.
+
+Vectors made by the server's embedding model at its dimension are copied as they are; the voyage-4 family (voyage-4-large, voyage-4, voyage-4-lite) shares one embedding space, so those are reused across models too. Other chunks are embedded again from their text; `+"`"+`push`+"`"+` shows the token estimate and asks first (`+"`"+`--yes`+"`"+` skips the question).
+
+Options: `+"`"+`--file other.db`+"`"+`, `+"`"+`--project ID`+"`"+` (repeatable), `+"`"+`--mode replace`+"`"+` (delete the server's copy of each project first; default `+"`"+`merge`+"`"+`), `+"`"+`--part-mb N`+"`"+` (part size; default 32).
+
+From the dashboard: **Import** → choose `+"`"+`rag.db`+"`"+` (or `+"`"+`rag.db.gz`+"`"+`) → review the plan → start; it uploads in parts too. With curl, for a store that fits in one request:
+
+    curl -H "Authorization: Bearer $TOKEN" --data-binary @rag.db {{BASE}}/api/import/upload
+    curl -H "Authorization: Bearer $TOKEN" -d '{"upload_id":"u_…","mode":"merge"}' {{BASE}}/api/import/start
+
+Bigger stores behind a proxy: `+"`"+`POST /api/import/parts`+"`"+` → `+"`"+`PUT /api/import/parts/{id}?offset=N`+"`"+` per part → `+"`"+`POST /api/import/parts/{id}/finish?size=TOTAL`+"`"+` (see the API reference).
+
+## Automatic conversion on the server
+
+When a server configured for pgvector starts and finds a SQLite store (`+"`"+`rag.db`+"`"+`) next to its config, it imports it into pgvector the same way and renames the file `+"`"+`rag.db.imported-<time>`+"`"+` (with its `+"`"+`-wal`+"`"+`/`+"`"+`-shm`+"`"+`). Switching an existing install from SQLite to pgvector is therefore: change the store in Settings, save & restart.`)
+}
+
+func docMCPTools(base, exe string) string {
+	return docText(base, exe, `# MCP tools
+
+enowx-rag exposes these MCP tools in every mode (local, client, and remote over `+"`"+`/mcp`+"`"+`). Project IDs isolate collections.
+
+## Write / index
+## `+"`"+`rag_create_project`+"`"+`
+Create a project collection. Input: `+"`"+`project_id`+"`"+`.
+
+## `+"`"+`rag_index`+"`"+`
+Index documents you pass directly. Input: `+"`"+`project_id`+"`"+`, `+"`"+`documents`+"`"+` (each `+"`"+`{id?, content, meta?}`+"`"+`). Use it to save facts and decisions.
+
+## `+"`"+`rag_index_project`+"`"+`
+Scan a folder and sync its code and text files: new and edited code is indexed, removed code and files deleted, incrementally. Honors `+"`"+`.gitignore`+"`"+`, skips node_modules/.git/vendor/dist/build and secrets. Input: `+"`"+`project_id`+"`"+`, `+"`"+`directory`+"`"+`. Run it once per folder: it is re-synced automatically before searches (`+"`"+`RAG_AUTO_SYNC_INTERVAL`+"`"+`, default 60s). In client mode the folder is read on your machine, not on the server.
+
+## Read / search
+## `+"`"+`rag_semantic_search`+"`"+`
+Search a project. Input: `+"`"+`project_id`+"`"+`, `+"`"+`query`+"`"+`, `+"`"+`limit`+"`"+`, and optionally `+"`"+`recall`+"`"+`, `+"`"+`hybrid`+"`"+`, `+"`"+`rerank`+"`"+`, `+"`"+`compress`+"`"+` (hybrid and rerank default on). Returns chunks with scores.
+
+## `+"`"+`rag_retrieve_context`+"`"+`
+Like search, but returns a compact context string plus the chunks — convenient for feeding an LLM. Same options as `+"`"+`rag_semantic_search`+"`"+`.
+
+## Inspect / manage
+## `+"`"+`rag_list_projects`+"`"+`
+All projects with chunk counts. No input.
+
+## `+"`"+`rag_project_exists`+"`"+`
+Whether a project has indexed memory. Input: `+"`"+`project_id`+"`"+`.
+
+## `+"`"+`rag_list_points`+"`"+`
+Chunks in a project (id, source file, preview), optionally filtered by `+"`"+`source_file`+"`"+`. Input: `+"`"+`project_id`+"`"+`, `+"`"+`source_file?`+"`"+`.
+
+## `+"`"+`rag_delete_points`+"`"+`
+Delete chunks by ID. Input: `+"`"+`project_id`+"`"+`, `+"`"+`point_ids`+"`"+`.
+
+## `+"`"+`rag_delete_project`+"`"+`
+Delete a project and all its data. Input: `+"`"+`project_id`+"`"+`.
+
+## `+"`"+`rag_stats`+"`"+`
+Projects, total chunks, embed model, latency, tokens (from the server in client mode). No input.
+
+**Typical loop:** `+"`"+`rag_index_project`+"`"+` once per folder → `+"`"+`rag_retrieve_context`+"`"+` before coding (file changes sync automatically) → do the work → `+"`"+`rag_index`+"`"+` the new facts and decisions.`)
+}
+
+func docAPIReference(base, exe string) string {
+	return docText(base, exe, `# API reference
+
+All endpoints are under {{BASE}}/api. When an admin token is set (`+"`"+`RAG_ADMIN_TOKEN`+"`"+` or `+"`"+`config.yaml`+"`"+`) every endpoint except `+"`"+`/api/health`+"`"+` and `+"`"+`/api/setup/status`+"`"+` needs `+"`"+`Authorization: Bearer <token>`+"`"+`. Endpoints marked 🔒 also need the token when none is configured, unless called from localhost. Errors are JSON `+"`"+`{error, hint?}`+"`"+`.
+
+## Server
+- `+"`"+`GET /api/health`+"`"+` — liveness, version, boot id (open)
+- `+"`"+`GET /api/server`+"`"+` — store, embedder, reranker, auto-sync, stale chunks, running jobs
+- `+"`"+`GET /api/models`+"`"+` — Voyage embedding and rerank catalog (dimensions, price, context)
+- `+"`"+`POST /api/models/test`+"`"+` 🔒 — test a Voyage model or reranker with a key
+- `+"`"+`POST /api/server/restart`+"`"+` 🔒 — restart the process (re-reads config.yaml)
+
+## Projects
+- `+"`"+`GET /api/projects`+"`"+` — projects with chunk counts and last sync source
+- `+"`"+`GET /api/projects/{id}`+"`"+` — one project
+- `+"`"+`POST /api/projects/{id}`+"`"+` — create
+- `+"`"+`DELETE /api/projects/{id}`+"`"+` — delete with all its chunks
+- `+"`"+`GET /api/projects/{id}/points`+"`"+` — chunks (`+"`"+`?source_file=&offset=&limit=`+"`"+`)
+- `+"`"+`POST /api/projects/{id}/points/delete`+"`"+` — delete chunks `+"`"+`{ids}`+"`"+`
+- `+"`"+`DELETE /api/projects/{id}/points/{pointId}`+"`"+` — delete one chunk
+- `+"`"+`POST /api/projects/{id}/reindex`+"`"+` — `+"`"+`{mode?: auto|files|reembed, directory?}`+"`"+`; a job. `+"`"+`auto`+"`"+` re-syncs the known folder when the server can read it, else re-embeds
+- `+"`"+`POST /api/projects/{id}/documents`+"`"+` — index documents `+"`"+`{documents: [{id?, content, meta?}]}`+"`"+`
+- `+"`"+`POST /api/projects/{id}/documents/payload`+"`"+` — update chunk metadata (client mode)
+- `+"`"+`POST /api/projects/{id}/sources`+"`"+` — report a sync from a machine (client mode)
+
+## Search, metrics, activity
+- `+"`"+`POST /api/search`+"`"+` — `+"`"+`{project_id, query, k, recall, hybrid, rerank, compress}`+"`"+`
+- `+"`"+`GET /api/stats`+"`"+` — totals + embed model
+- `+"`"+`GET /api/metrics`+"`"+` — latency, tokens, retrieval breakdown (see *Metrics*)
+- `+"`"+`GET /api/activity`+"`"+` — recent events (persisted)
+- `+"`"+`GET /api/events`+"`"+` — SSE stream of the same events, live
+- `+"`"+`GET /api/jobs`+"`"+`, `+"`"+`GET /api/jobs/{id}`+"`"+` — background jobs (re-index, import, startup)
+
+## Import
+- `+"`"+`POST /api/import/upload`+"`"+` — body: a SQLite store, raw or gzip; returns the plan + cost estimate
+- `+"`"+`POST /api/import/start`+"`"+` — `+"`"+`{upload_id, projects?, mode?: merge|replace, rename?}`+"`"+`; a job
+- `+"`"+`DELETE /api/import/upload/{id}`+"`"+` — discard an upload (they expire after an hour)
+- `+"`"+`POST /api/import/parts`+"`"+` — start an upload in parts (for proxies that cap the request size); returns `+"`"+`{upload_id, part_bytes}`+"`"+`
+- `+"`"+`PUT /api/import/parts/{id}?offset=N`+"`"+` — the next part, starting at byte N; returns `+"`"+`{received}`+"`"+`, or 409 `+"`"+`{received}`+"`"+` when N is not what the server holds
+- `+"`"+`POST /api/import/parts/{id}/finish?size=TOTAL`+"`"+` — read the upload; returns the same plan as `+"`"+`/import/upload`+"`"+`
+
+## Setup & settings
+- `+"`"+`GET /api/setup/status`+"`"+` — configured? what's missing, env-locked keys (open)
+- `+"`"+`GET /api/setup/detect`+"`"+` 🔒 — what the server can find on its own (database, key, old SQLite store)
+- `+"`"+`POST /api/setup/test`+"`"+` 🔒 — test store, embedder and reranker
+- `+"`"+`POST /api/setup/apply`+"`"+` 🔒 — save config.yaml (`+"`"+`restart: true`+"`"+` restarts)
+- `+"`"+`GET /api/setup/config`+"`"+` — current config, secrets masked
+- `+"`"+`GET /api/setup/config/reveal`+"`"+` 🔒 — with secrets
+- `+"`"+`POST /api/setup/config`+"`"+` 🔒 — change settings; returns warnings (re-embed cost, restart)
+- `+"`"+`POST /api/setup/gen-token`+"`"+` 🔒 — generate and save an admin token
+- `+"`"+`GET /api/setup/mcp-snippet?client_id=&mode=client|remote`+"`"+` — config to paste into a client
 
 ## Migration
-- `+"`POST /api/migrate`"+` — re-embed/move a project to a new destination (async, SSE)
+- `+"`"+`POST /api/migrate`+"`"+` 🔒 — re-embed or move a project to another store (see *Migration*)
 
 ## Docs
-- `+"`GET /api/docs`"+` — this table of contents
-- `+"`GET /api/docs/{section}`"+` — one section as markdown`, base)
+- `+"`"+`GET /api/docs`+"`"+` — this table of contents
+- `+"`"+`GET /api/docs/{section}`+"`"+` — one section as markdown`)
 }
 
-func docEmbedders(_, _ string) string {
-	return "# Embedders\n\n" +
-		"Set with `RAG_EMBEDDER`. Vectors of different models or dimensions can't be compared, " +
-		"so after you change the model or dimension (and restart), the first search or sync of " +
-		"each project re-embeds the points another model wrote, code chunks and memory notes " +
-		"alike, from their stored text. The built-in SQLite store takes the new vectors in place; " +
-		"a Qdrant collection or pgvector table has a fixed size, so a new dimension there needs " +
-		"a *Migration* to a new collection or table.\n\n" +
-		"## Voyage AI (`voyage`)\nHosted, high quality, free tier. `RAG_VOYAGE_API_KEY`, " +
-		"`RAG_VOYAGE_MODEL` (default `voyage-4`). Also powers reranking (`RAG_RERANKER_MODEL`).\n\n" +
-		"## OpenAI-compatible (`openai`)\nAny `/v1/embeddings` API — OpenAI, Together, Jina, " +
-		"Mistral, a local Ollama, LiteLLM, etc. Set `RAG_OPENAI_BASE_URL`, `RAG_OPENAI_MODEL`, " +
-		"`RAG_OPENAI_API_KEY` (empty for local), `RAG_OPENAI_DIM` (0 = auto-detect).\n\n" +
-		"## TEI (`tei`)\nSelf-hosted Text Embeddings Inference. Serve **any** local model " +
-		"(BGE, GTE, E5, nomic-embed, …) and point `RAG_TEI_URL` at it. TEI is a server, not a " +
-		"single model."
+func docEmbedders(base, exe string) string {
+	return docText(base, exe, `# Embedders (Voyage)
+
+## Voyage AI (`+"`"+`voyage`+"`"+`, recommended)
+
+Set the key and models in **Settings → Models** (or the wizard). Every choice shows the dimensions it supports, the price per million tokens and the context length, and **Test** calls Voyage with your key: you see the dimension it returned, the latency and the tokens used, or the error with a hint (wrong key, quota, model name).
+
+| Model | Use |
+| --- | --- |
+| `+"`"+`voyage-4-large`+"`"+` | best quality |
+| `+"`"+`voyage-4`+"`"+` | default; quality and cost balanced |
+| `+"`"+`voyage-4-lite`+"`"+` | cheapest, fastest |
+| `+"`"+`voyage-code-4`+"`"+` | tuned for code |
+
+Embedding dimension: 1024 (default), 256, 512 or 2048. Smaller vectors are cheaper to store and search, at some quality cost.
+
+**Rerank** (`+"`"+`rerank-3`+"`"+` default, `+"`"+`rerank-3-lite`+"`"+` faster, or off) re-orders the search candidates by relevance; its test ranks sample documents to show it works.
+
+Environment: `+"`"+`RAG_VOYAGE_API_KEY`+"`"+`, `+"`"+`RAG_VOYAGE_MODEL`+"`"+`, `+"`"+`RAG_VECTOR_DIM`+"`"+`, `+"`"+`RAG_RERANKER_MODEL`+"`"+` (`+"`"+`off`+"`"+` disables). `+"`"+`RAG_VOYAGE_BASE_URL`+"`"+` points at a Voyage-compatible gateway.
+
+## Changing the model or dimension
+
+Vectors of different models or dimensions can't be compared. Settings tells you before you save:
+
+- within the voyage-4 family at the same dimension: **no re-embed** (shared embedding space);
+- otherwise: how many chunks are embedded again, the estimated tokens and cost.
+
+After the restart, a background job re-embeds the affected chunks from their stored text (pgvector resizes its column first, only once a test embedding with the new settings succeeded). Searches skip chunks that aren't re-embedded yet.
+
+## Other embedders
+
+- **OpenAI-compatible** (`+"`"+`openai`+"`"+`): any `+"`"+`/v1/embeddings`+"`"+` API — OpenAI, Together, Jina, Mistral, Ollama, LiteLLM. `+"`"+`RAG_OPENAI_BASE_URL`+"`"+`, `+"`"+`RAG_OPENAI_MODEL`+"`"+`, `+"`"+`RAG_OPENAI_API_KEY`+"`"+`, `+"`"+`RAG_OPENAI_DIM`+"`"+` (0 = detect).
+- **TEI** (`+"`"+`tei`+"`"+`): self-hosted Text Embeddings Inference. `+"`"+`RAG_TEI_URL`+"`"+`.
+
+The server starts without a key; until one is set, indexing and search answer with an error that says to set it.`)
 }
 
-func docVectorStores(_, _ string) string {
-	return "# Vector stores\n\n" +
-		"Set with `RAG_VECTOR_STORE`. One project = one collection.\n\n" +
-		"## Qdrant (`qdrant`)\nSupported. Per-collection dimension (flexible for migration). " +
-		"`RAG_QDRANT_URL`, optional `RAG_QDRANT_API_KEY` (cloud).\n\n" +
-		"## pgvector (`pgvector`)\nSupported; recommended for **hybrid search** and the " +
-		"dense/lexical **retrieval breakdown**. `RAG_PGVECTOR_DSN`. Note: all projects share one " +
-		"table with a **fixed** vector dimension — changing dimension means migrating to a new " +
-		"table.\n\n" +
-		"## Chroma (`chroma`)\n**Experimental** — targets the legacy `/api/v1` REST API and is " +
-		"mock-tested only, not verified against a live server (Chroma ≥ 0.6 moved to `/api/v2`). " +
-		"Prefer Qdrant or pgvector.\n\n" +
-		"| Feature | Qdrant | pgvector | Chroma |\n| --- | :---: | :---: | :---: |\n" +
-		"| Index / search / delete | ✅ | ✅ | ⚠️ |\n| Project list + stats | ✅ | ✅ | ⚠️ |\n" +
-		"| Hybrid search | — | ✅ | — |\n| Retrieval breakdown | — | ✅ | — |"
+func docVectorStores(base, exe string) string {
+	return docText(base, exe, `# Vector stores
+
+Set with `+"`"+`vector_store`+"`"+` in config.yaml or `+"`"+`RAG_VECTOR_STORE`+"`"+`.
+
+## PostgreSQL + pgvector (`+"`"+`pgvector`+"`"+`, recommended for a server)
+`+"`"+`RAG_PGVECTOR_DSN`+"`"+`. One table for all projects, an HNSW index, hybrid search (dense + full-text) and the retrieval breakdown. A new embedding dimension resizes the vector column after a successful test embedding, then the chunks are re-embedded in the background. The wizard's test reports the PostgreSQL and pgvector versions and whether the extension can be created.
+
+## Built-in SQLite (`+"`"+`sqlite`+"`"+`, local)
+No service to run: `+"`"+`~/.enowx-rag/rag.db`+"`"+` (or `+"`"+`sqlite_path`+"`"+`). Best for a single machine. A server configured for pgvector imports it on start.
+
+## Remote (`+"`"+`remote`+"`"+`, client mode)
+Not a store on this machine: chunks go to an enowx-rag server (`+"`"+`RAG_REMOTE_URL`+"`"+`, `+"`"+`RAG_REMOTE_TOKEN`+"`"+`). See *Connect machines & import*.
+
+## Qdrant (`+"`"+`qdrant`+"`"+`)
+`+"`"+`RAG_QDRANT_URL`+"`"+`, optional `+"`"+`RAG_QDRANT_API_KEY`+"`"+`. One collection per project.
+
+## Chroma (`+"`"+`chroma`+"`"+`)
+**Experimental**: legacy `+"`"+`/api/v1`+"`"+` API, mock-tested only.
+
+| Feature | pgvector | SQLite | Qdrant | Chroma |
+| --- | :---: | :---: | :---: | :---: |
+| Index / search / delete | ✅ | ✅ | ✅ | ⚠️ |
+| Hybrid search | ✅ | ✅ | — | — |
+| Retrieval breakdown | ✅ | — | — | — |
+| Resize on new dimension | ✅ | ✅ | — | — |`)
 }
 
-func docSearch(_, _ string) string {
-	return "# Search: hybrid, rerank, compress\n\n" +
-		"Options on `POST /api/search` and the search MCP tools.\n\n" +
-		"## Recall vs. K\n`recall` (default 40) candidates are retrieved, then narrowed to `k` " +
-		"(default 5) final results. Reranking works best with recall > k.\n\n" +
-		"## Hybrid (`hybrid`)\nCombines dense vector similarity with lexical full-text search " +
-		"using Reciprocal Rank Fusion (RRF, k=60). **pgvector only** — other backends fall back to " +
-		"dense. Great for keyword-heavy queries.\n\n" +
-		"## Rerank (`rerank`)\nRe-orders candidates with Voyage `rerank-2.5` when configured. " +
-		"Retrieve `recall` → rerank → keep top `k`. Falls back to semantic order if the reranker " +
-		"is unavailable.\n\n" +
-		"## Compress (`compress`)\nDrops near-duplicate results (same content hash / identical " +
-		"content) after ranking — deterministic, no LLM. Tightens context sent to the model.\n\n" +
-		"## Retrieval breakdown\nOn pgvector hybrid searches, the dashboard shows how many results " +
-		"came from the dense vs. lexical ranking (see *Metrics*)."
+func docSearch(base, exe string) string {
+	return docText(base, exe, `# Search: hybrid, rerank, compress
+
+Options on `+"`"+`POST /api/search`+"`"+` and the search MCP tools.
+
+## Recall vs. K
+`+"`"+`recall`+"`"+` (default 40) candidates are retrieved, then narrowed to `+"`"+`k`+"`"+` (default 5) results. Reranking works best with recall > k.
+
+## Hybrid (`+"`"+`hybrid`+"`"+`)
+Combines dense vector similarity with lexical full-text search using Reciprocal Rank Fusion (RRF, k=60). Stores without it fall back to dense search. Good for keyword-heavy queries.
+
+## Rerank (`+"`"+`rerank`+"`"+`)
+Re-orders the candidates with the Voyage rerank model (`+"`"+`rerank-3`+"`"+` by default) when one is configured: retrieve `+"`"+`recall`+"`"+` → rerank → keep the top `+"`"+`k`+"`"+`. Falls back to the semantic order if the reranker fails.
+
+## Compress (`+"`"+`compress`+"`"+`)
+Drops near-duplicate results (same content hash or identical text) after ranking — deterministic, no LLM.
+
+## Retrieval breakdown
+On pgvector hybrid searches, the dashboard shows how many results came from the dense and the lexical ranking (see *Metrics*).`)
 }
 
-func docMigration(base, _ string) string {
-	return "# Migration\n\n" +
-		"Re-embed a project's stored text into a new destination — to change embedding " +
-		"model/dimension or move between vector stores. Raw vectors are model-specific and not " +
-		"portable, so migration re-embeds from the text stored alongside every chunk.\n\n" +
-		"## Use cases\n" +
-		"- **Change model / dimension** — pick a new embedder/model/dim; the destination is " +
-		"re-embedded. (For pgvector, a new dimension needs a **new table name**.) To change the " +
-		"model of the store you run on, no migration is needed: edit the config and restart; " +
-		"projects are re-embedded in place on their next search or sync.\n" +
-		"- **Move between stores** — e.g. Qdrant → pgvector, or into the built-in SQLite store " +
-		"(`vector_store: sqlite`, optional `sqlite_path`; empty is the running store's file, " +
-		"where the destination project name must differ from the source).\n" +
-		"- **Import from cloud** — Qdrant Cloud is verified; Pinecone, Weaviate, and Chroma Cloud " +
-		"connectors are *experimental* (mock-tested only) and labelled as such in the UI.\n\n" +
-		"## How\nUse the **Migration** page, or `POST /api/migrate`. It runs asynchronously with " +
-		"live progress over SSE (`migration_started/progress/completed/failed`). The source is " +
-		"never auto-deleted — after success the UI offers an explicit delete.\n\n" +
-		"Body (in-store): `{source_project, dest_project, vector_store, embedder, ...connection/model/dim}`.\n" +
-		"Body (cloud import): add `cloud_source: {provider, url, api_key, index, text_field}`."
+func docMigration(base, exe string) string {
+	return docText(base, exe, `# Migration (API)
+
+To bring local memory to a server, use *Connect machines & import* (`+"`"+`enowx-rag push`+"`"+` or the dashboard's **Import** page). To change the embedding model or dimension of the store you run on, change it in Settings: the chunks are re-embedded in place.
+
+`+"`"+`POST /api/migrate`+"`"+` 🔒 remains for moving a project between stores with credentials you pass (e.g. Qdrant → pgvector, or a Qdrant Cloud import). It re-embeds from the text stored with every chunk, runs as a job with progress events (`+"`"+`migration_started/progress/completed/failed`+"`"+`), and never deletes the source.
+
+Body (between stores): `+"`"+`{source_project, dest_project, vector_store, embedder, ...connection/model/dim}`+"`"+`. Body (cloud import): add `+"`"+`cloud_source: {provider, url, api_key, index, text_field}`+"`"+` (Qdrant Cloud is verified; Pinecone, Weaviate and Chroma Cloud are experimental).`)
 }
 
-func docMetrics(base, _ string) string {
-	return fmt.Sprintf("# Metrics\n\n"+
-		"Every search records metrics, exposed at `GET %s/api/metrics` and shown on the "+
-		"dashboard Overview.\n\n"+
-		"## What's tracked\n"+
-		"- **Latency** — average, p50, p95 over recent queries.\n"+
-		"- **Token usage** — embed + rerank tokens reported by the Voyage API (0 for backends "+
-		"that don't report, e.g. TEI).\n"+
-		"- **Retrieval breakdown** — dense vs. lexical counts on pgvector hybrid searches.\n"+
-		"- **Backend** and **persistent** flag.\n\n"+
-		"## Persistence\nMetrics are stored in a local SQLite file (`~/.enowx-rag/metrics.db`, "+
-		"pure-Go, no external service), so they survive restarts on **any** backend. If the file "+
-		"can't be opened, metrics fall back to in-memory (`\"persistent\": false`).", base)
+func docMetrics(base, exe string) string {
+	return docText(base, exe, `# Metrics
+
+Every search records metrics, exposed at `+"`"+`GET {{BASE}}/api/metrics`+"`"+` and shown on the dashboard Overview.
+
+## What's tracked
+- **Latency** — average, p50, p95 over recent queries.
+- **Token usage** — embed and rerank tokens reported by Voyage (0 for backends that don't report them, e.g. TEI).
+- **Retrieval breakdown** — dense vs. lexical counts on pgvector hybrid searches.
+- **Activity** — syncs reported by machines, imports, re-index and startup jobs, restarts (`+"`"+`GET /api/activity`+"`"+`, live over `+"`"+`GET /api/events`+"`"+`).
+
+In client mode the server records the metrics of the searches it runs for your machines.
+
+## Persistence
+Metrics and activity live in a local SQLite file (`+"`"+`~/.enowx-rag/metrics.db`+"`"+`, `+"`"+`/data/.enowx-rag/metrics.db`+"`"+` in Docker), so they survive restarts on any store. If it can't be opened, metrics fall back to memory (`+"`"+`"persistent": false`+"`"+`).`)
 }
 
-func docRemote(base, _ string) string {
-	return "# Remote / daemon\n\n" +
-		"Run enowx-rag as a **daemon** (e.g. on a VPS) and let agents connect **remotely** over " +
-		"MCP-over-HTTP — a centralized RAG memory shared across machines/agents.\n\n" +
-		"## Run the daemon\n" +
-		"`enowx-rag --serve` exposes three things on one port:\n" +
-		"- `/api/*` — REST API\n" +
-		"- `/mcp` — MCP server over HTTP (Streamable HTTP transport, stateless)\n" +
-		"- `/` — the web dashboard\n\n" +
-		"## Secure it (required when public)\n" +
-		"Set `RAG_ADMIN_TOKEN` to a strong secret. It gates **both** `/api/*` and `/mcp` with " +
-		"`Authorization: Bearer <token>`. When unset, there is **no auth** — only safe for a trusted " +
-		"local network. Terminate TLS with a reverse proxy (Caddy/nginx) in front.\n\n" +
-		"    RAG_ADMIN_TOKEN=$(openssl rand -hex 32) enowx-rag --serve --addr :7777\n\n" +
-		"## Connect an agent (MCP remote)\n" +
-		"Point your MCP client at the daemon URL with the bearer header:\n\n" +
-		"    {\n      \"mcpServers\": {\n        \"enowx-rag\": {\n          \"url\": \"https://rag.example.com/mcp\",\n" +
-		"          \"headers\": { \"Authorization\": \"Bearer <RAG_ADMIN_TOKEN>\" }\n        }\n      }\n    }\n\n" +
-		"All six MCP tools (see *MCP tools*) work identically to the local stdio mode.\n\n" +
-		"## Local vs. remote\n" +
-		"- **Local**: run `enowx-rag` with no flags — stdio, spawned by the client. No daemon needed.\n" +
-		"- **Remote**: run `enowx-rag --serve` on a host; clients connect to `/mcp` by URL.\n\n" +
-		"The vector store (Qdrant/pgvector) can be local to the daemon or a managed cloud instance."
+func docRemote(base, exe string) string {
+	return docText(base, exe, `# MCP over HTTP
+
+Besides client mode (see *Connect machines & import*), an MCP client can talk to the server directly at `+"`"+`/mcp`+"`"+` (Streamable HTTP, stateless). Then the server also reads the project folders, so `+"`"+`rag_index_project`+"`"+` only works for folders on the server; use client mode for code on your machine.
+
+    {
+      "mcpServers": {
+        "enowx-rag": {
+          "url": "{{BASE}}/mcp",
+          "headers": { "Authorization": "Bearer <ADMIN_TOKEN>" }
+        }
+      }
+    }
+
+`+"`"+`GET /api/setup/mcp-snippet?client_id=<id>&mode=remote`+"`"+` returns this in the format a given client expects.
+
+The admin token gates `+"`"+`/mcp`+"`"+` and `+"`"+`/api`+"`"+` alike. Without a token there is no auth: only acceptable on a trusted local network.`)
 }
 
 func docAgentSetup(base, exe string) string {
-	return fmt.Sprintf(`# Agent setup
+	return docText(base, exe, `# Agent setup
 
-Set up enowx-rag (per-project RAG memory) for the current project. Do the steps
-below in order. Skip any step that the probe reports as already done. All calls
-go to the enowx-rag server at %s.
+Set up enowx-rag memory for the current project, on the machine where the code is. Skip any step that is already done. The enowx-rag server is {{BASE}}.
 
-## 1. Probe what already exists
+## 1. Install the binary (skip if `+"`"+`enowx-rag version`+"`"+` works)
 
-GET %s/api/setup/probe?client=<CLIENT_ID>&dir=<ABS_PROJECT_DIR>
+    curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/install.sh | sh
 
-Response:
-- mcp: { "<client>": true|false }  — is the enowx-rag MCP server in that client's config
-- skill: { installed: bool, dir }  — is the skill installed
-- agents_md: { exists, has_block } — does the project's AGENTS.md have the enowx-rag block
+## 2. Connect your MCP client (skip if its config already has an `+"`"+`enowx-rag`+"`"+` entry)
 
-Pick CLIENT_ID from: claude-code, claude-desktop, cursor, cline, windsurf, codex, zed, continue.
+    enowx-rag connect --remote {{BASE}} --token <ADMIN_TOKEN> --client <CLIENT_ID>
 
-## 2. Install the MCP server (skip if mcp[client] is true)
+CLIENT_ID is one of: claude-code, claude-desktop, cursor, cline, windsurf, codex, zed, continue. Ask the user for the admin token if you don't have it; never write it into the project. The client must be restarted to load the server.
 
-POST %s/api/setup/install-mcp  { "client_id": "<CLIENT_ID>", "scope": "global" }
+## 3. Install the skill (optional; Claude Code and Factory)
 
-This merges the enowx-rag server into the client's config (backing up the
-original). For a manual snippet instead: GET %s/api/setup/mcp-snippet?client_id=<CLIENT_ID>.
+    mkdir -p ~/.claude/skills/enowx-rag
+    curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/skill/enowx-rag.md -o ~/.claude/skills/enowx-rag/skill.md
 
-The MCP server binary is: %s
+## 4. Add the enowx-rag block to the project's AGENTS.md (skip if it has `+"`"+`<!-- enowx-rag:start -->`+"`"+`)
 
-### Local vs. remote
-- **Local (default)**: the client spawns the binary above over stdio.
-- **Remote daemon**: to connect to an enowx-rag daemon (running elsewhere with
-  ` + "`enowx-rag --serve`" + `), add ` + "`mode: \"remote\"`" + `, ` + "`remote_url`" + ` (e.g.
-  https://rag.example.com/mcp), and ` + "`token`" + ` (its RAG_ADMIN_TOKEN) to the
-  install-mcp body — or ` + "`?mode=remote&remote_url=...&token=...`" + ` on the snippet.
-  This writes a ` + "`{url, headers: {Authorization}}`" + ` entry instead of a local command.
-  See the *Remote / daemon* section.
+Append this, with PROJECT_ID replaced by a short slug for the project (e.g. the repository name):
 
-## 3. Install the skill (skip if skill.installed is true)
+{{AGENTS_BLOCK}}
 
-Skills are supported by some clients only (e.g. Claude Code, Factory). Get the
-exact commands: GET %s/api/setup/skill-guide — then run them.
+## 5. Index the project
 
-## 4. Write the project's AGENTS.md (skip if agents_md.has_block is true)
-
-POST %s/api/setup/write-agents-md  { "dir": "<ABS_PROJECT_DIR>", "project_id": "<PROJECT_ID>" }
-
-This merges an enowx-rag section into AGENTS.md idempotently (markers
-<!-- enowx-rag:start --> ... <!-- enowx-rag:end -->), preserving existing content.
-
-## 5. Index the project (optional but recommended)
-
-POST %s/api/projects/<PROJECT_ID>/reindex  { "directory": "<ABS_PROJECT_DIR>" }
-
-## Notes
-- Use an absolute project directory for dir.
-- PROJECT_ID is a short slug for this project (e.g. the repo name).
-- Endpoints that write files require the request to originate from localhost (or a valid RAG_ADMIN_TOKEN).
-`, base, base, base, base, exe, base, base, base)
+Call the `+"`"+`rag_index_project`+"`"+` MCP tool with PROJECT_ID and the project's absolute folder. Existing local memory: `+"`"+`enowx-rag push --remote {{BASE}} --token <ADMIN_TOKEN>`+"`"+`.`)
 }

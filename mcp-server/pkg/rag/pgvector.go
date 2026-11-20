@@ -2,7 +2,11 @@ package rag
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -17,6 +21,7 @@ type PGVectorProvider struct {
 	embedder EmbeddingClient
 	dim      int
 	table    string
+	dsn      string
 }
 
 // NewPGVectorProvider connects to Postgres and ensures the project table exists.
@@ -33,6 +38,7 @@ func NewPGVectorProvider(ctx context.Context, dsn string, embedder EmbeddingClie
 		embedder: embedder,
 		dim:      embedder.VectorSize(),
 		table:    table,
+		dsn:      dsn,
 	}
 	if p.dim <= 0 {
 		p.dim = 384
@@ -45,10 +51,73 @@ func NewPGVectorProvider(ctx context.Context, dsn string, embedder EmbeddingClie
 		pool.Close()
 		return nil, err
 	}
+	if err := p.ensureDim(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return p, nil
 }
 
+// ensureDim resizes the embedding column when the configured vector size
+// changed (e.g. voyage-4 at 1024 → 2048). A vector column has one fixed size,
+// so the old vectors can't stay: they are cleared, and the points keep their
+// text and metadata (embed_dim names the old size), so core.Service re-embeds
+// them from the stored text with the new model. Searches skip points without
+// a vector meanwhile.
+func (p *PGVectorProvider) ensureDim(ctx context.Context) error {
+	cur, err := p.columnDim(ctx)
+	if err != nil || cur <= 0 || cur == p.dim {
+		return err
+	}
+	// The size an embedder reports can be a guess (TEI falls back to a default
+	// when it is unreachable; a missing API key leaves a stand-in): measure a
+	// real vector before clearing anything, and keep the table as it is when
+	// that isn't possible.
+	probe, perr := p.embedder.Embed(ctx, []string{"embedding size probe"})
+	if perr != nil || len(probe) != 1 || len(probe[0]) == 0 {
+		fmt.Fprintf(os.Stderr, "pgvector: the table stores %d-dimension vectors but the embedder reports %d and could not be "+
+			"checked (%v): keeping the table as it is\n", cur, p.dim, perr)
+		p.dim = cur
+		return nil
+	}
+	if len(probe[0]) == cur {
+		p.dim = cur
+		return nil
+	}
+	p.dim = len(probe[0])
+	if _, err := p.pool.Exec(ctx, fmt.Sprintf(
+		`ALTER TABLE %s ALTER COLUMN embedding TYPE vector(%d) USING NULL`, p.table, p.dim)); err != nil {
+		return fmt.Errorf("pgvector: resize embedding column from %d to %d dimensions: %w", cur, p.dim, err)
+	}
+	fmt.Fprintf(os.Stderr, "pgvector: embedding size changed %d → %d: vectors cleared, points are re-embedded from their stored text\n", cur, p.dim)
+	return nil
+}
+
+// columnDim is the embedding column's declared size (0 when unknown).
+func (p *PGVectorProvider) columnDim(ctx context.Context) (int, error) {
+	var typmod int
+	err := p.pool.QueryRow(ctx, `
+SELECT a.atttypmod FROM pg_attribute a
+JOIN pg_class c ON c.oid = a.attrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = $1 AND n.nspname = current_schema() AND a.attname = 'embedding' AND NOT a.attisdropped`, p.table).Scan(&typmod)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return typmod, nil
+}
+
 func (p *PGVectorProvider) ensureTable(ctx context.Context) error {
+	// The vector type comes from the pgvector extension. CREATE EXTENSION needs
+	// the extension files on the server (the pgvector/pgvector Docker image has
+	// them) and a role allowed to create it (the database owner is, since PG 13).
+	if _, err := p.pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS vector`); err != nil {
+		return fmt.Errorf("pgvector: enable the \"vector\" extension: %w — use a PostgreSQL with pgvector installed "+
+			"(e.g. the pgvector/pgvector:pg17 Docker image) or run CREATE EXTENSION vector; as a superuser", err)
+	}
 	// The id column is TEXT (not UUID) because the indexer generates string
 	// IDs like "dir/file.go#chunk0". A UUID column would reject these IDs.
 	//
@@ -144,14 +213,11 @@ func (p *PGVectorProvider) Index(ctx context.Context, projectID string, docs []D
 
 	batch := &pgx.Batch{}
 	for i, d := range docs {
-		id := d.ID
+		id := pgText(d.ID)
 		if id == "" {
 			id = uuid.NewString()
 		}
-		meta := make(map[string]string, len(d.Meta)+2)
-		for k, v := range d.Meta {
-			meta[k] = v
-		}
+		meta := pgMeta(d.Meta, 2)
 		// The embedder that made this vector, over whatever model a migrated
 		// or re-embedded document still names.
 		meta["embed_model"] = embedModel
@@ -163,7 +229,7 @@ ON CONFLICT (project_id, id) DO UPDATE SET
 	content = EXCLUDED.content,
 	metadata = EXCLUDED.metadata,
 	embedding = EXCLUDED.embedding
-`, p.table), id, projectID, d.Content, meta, pgVectorLiteral(vectors[i]))
+`, p.table), id, projectID, pgText(d.Content), meta, pgVectorLiteral(vectors[i]))
 	}
 	br := p.pool.SendBatch(ctx, batch)
 	return br.Close()
@@ -190,7 +256,7 @@ func (p *PGVectorProvider) SemanticSearch(ctx context.Context, projectID, query 
 	q := fmt.Sprintf(`
 SELECT id, content, metadata, 1 - (embedding <=> $1::vector) AS score
 FROM %s
-WHERE project_id = $2
+WHERE project_id = $2 AND embedding IS NOT NULL
 ORDER BY embedding <=> $1::vector
 LIMIT $3
 `, p.table)
@@ -246,7 +312,7 @@ WITH dense AS (
   SELECT id, content, metadata,
          ROW_NUMBER() OVER (ORDER BY embedding <=> $1::vector) AS rank
   FROM %s
-  WHERE project_id = $2
+  WHERE project_id = $2 AND embedding IS NOT NULL
   ORDER BY embedding <=> $1::vector
   LIMIT $3
 ),
@@ -311,9 +377,9 @@ func (p *PGVectorProvider) DeletePoints(ctx context.Context, projectID string, p
 func (p *PGVectorProvider) ListPointIDs(ctx context.Context, projectID string, metaFilter map[string]string) ([]string, error) {
 	q := fmt.Sprintf("SELECT id FROM %s WHERE project_id = $1", p.table)
 	args := []any{projectID}
-	if v, ok := metaFilter["source_file"]; ok {
-		q += " AND metadata->>'source_file' = $2"
-		args = append(args, v)
+	if f := metaFilterJSON(metaFilter); f != "" {
+		q += " AND metadata @> $2::jsonb"
+		args = append(args, f)
 	}
 	rows, err := p.pool.Query(ctx, q, args...)
 	if err != nil {
@@ -334,9 +400,9 @@ func (p *PGVectorProvider) ListPointIDs(ctx context.Context, projectID string, m
 func (p *PGVectorProvider) ListPoints(ctx context.Context, projectID string, metaFilter map[string]string) ([]PointInfo, error) {
 	q := fmt.Sprintf("SELECT id, metadata->>'source_file', metadata->>'content_hash', metadata->>'chunk_version', metadata->>'doc_id', LEFT(content, 200), metadata->>'chunk_index' FROM %s WHERE project_id = $1", p.table)
 	args := []any{projectID}
-	if v, ok := metaFilter["source_file"]; ok {
-		q += " AND metadata->>'source_file' = $2"
-		args = append(args, v)
+	if f := metaFilterJSON(metaFilter); f != "" {
+		q += " AND metadata @> $2::jsonb"
+		args = append(args, f)
 	}
 	q += " ORDER BY metadata->>'source_file', metadata->>'chunk_index'"
 	rows, err := p.pool.Query(ctx, q, args...)
@@ -464,12 +530,51 @@ func (p *PGVectorProvider) ListProjectIDs(ctx context.Context) ([]string, error)
 	return ids, rows.Err()
 }
 
-func pgVectorLiteral(v []float32) string {
-	parts := make([]string, len(v))
-	for i, x := range v {
-		parts[i] = fmt.Sprintf("%f", x)
+// metaFilterJSON is the JSONB containment filter for metaFilter ("" = none):
+// every key must match (the indexer filters by source_dir, the UI by
+// source_file).
+func metaFilterJSON(metaFilter map[string]string) string {
+	if len(metaFilter) == 0 {
+		return ""
 	}
-	return "[" + strings.Join(parts, ",") + "]"
+	raw, _ := json.Marshal(metaFilter)
+	return string(raw)
+}
+
+func pgVectorLiteral(v []float32) string {
+	var sb strings.Builder
+	sb.Grow(len(v) * 11)
+	sb.WriteByte('[')
+	for i, x := range v {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		// Shortest exact float32 form ("%f" kept 6 decimals and lost the
+		// precision of small components).
+		sb.WriteString(strconv.FormatFloat(float64(x), 'g', -1, 32))
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
+// parsePGVector reads pgvector's text form "[0.1,0.2,…]".
+func parsePGVector(s string) ([]float32, error) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "[")
+	s = strings.TrimSuffix(s, "]")
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]float32, len(parts))
+	for i, part := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(part), 32)
+		if err != nil {
+			return nil, fmt.Errorf("parse vector: %w", err)
+		}
+		out[i] = float32(f)
+	}
+	return out, nil
 }
 
 // Compile-time assertion that PGVectorProvider implements HybridSearcher.

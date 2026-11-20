@@ -9,6 +9,8 @@ When asked to install, set up, or configure RAG memory, first decide which of tw
 
 To tell them apart: check whether the enowx-rag MCP tools are already available. If they are, use Path B. If they are not (or you are unsure and the binary isn't built), use Path A.
 
+**Path C — The user runs an enowx-rag server (e.g. on a VPS).** If the user gives you a server URL and admin token, don't build or start any backend: install the binary (`curl -fsSL https://raw.githubusercontent.com/enowdev/enowx-rag/main/install.sh | sh`), then run `enowx-rag connect --remote <URL> --token <TOKEN>` (it configures every MCP client found here in client mode; `--client <id>` to pick one). Existing local memory goes to the server with `enowx-rag push --remote <URL> --token <TOKEN>`. Then do sections 1 and 5. Never write the token into the project. To set up such a server: `deploy/install-vps.sh` (see README → Deploy on a VPS).
+
 ## 1. Install the skill
 
 The skill lives at `skill/enowx-rag.md` in this repository. It is not Factory-Droid-only — install it into whatever skill directory your tool reads. The skill can be global (shared across projects) or project-local.

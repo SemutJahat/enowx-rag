@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -56,6 +57,83 @@ type Config struct {
 	// AdminToken, when set, gates /api and /mcp with a bearer token. The env var
 	// RAG_ADMIN_TOKEN takes precedence over this file value (see EffectiveAdminToken).
 	AdminToken string `yaml:"admin_token,omitempty"`
+	// RemoteURL / RemoteToken configure client mode (vector_store: remote):
+	// the enowx-rag server (`--serve`, e.g. on a VPS) that embeds and stores,
+	// and its admin token. Env: RAG_REMOTE_URL, RAG_REMOTE_TOKEN.
+	RemoteURL   string `yaml:"remote_url,omitempty"`
+	RemoteToken string `yaml:"remote_token,omitempty"`
+	// AutoImportSQLite: when the store is pgvector and the SQLite store file
+	// (sqlite_path, default ~/.enowx-rag/rag.db) holds points, the server
+	// imports them into pgvector once at startup. Default on; "false" turns it
+	// off. Env: RAG_AUTO_IMPORT_SQLITE.
+	AutoImportSQLite string `yaml:"auto_import_sqlite,omitempty"`
+}
+
+// RerankerEnabled reports whether a reranker model is configured ("", "off",
+// "none", "false" and "disabled" turn reranking off).
+func (cfg *Config) RerankerEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(cfg.RerankerModel)) {
+	case "", "off", "none", "false", "disabled", "0":
+		return false
+	}
+	return true
+}
+
+// AutoImportEnabled reports whether the one-time SQLite → pgvector import at
+// server startup is on (default yes).
+func (cfg *Config) AutoImportEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(cfg.AutoImportSQLite)) {
+	case "false", "off", "no", "0", "disabled":
+		return false
+	}
+	return true
+}
+
+// envVars maps each setting to the environment variable that overrides it.
+var envVars = []struct{ Key, Env string }{
+	{"vector_store", "RAG_VECTOR_STORE"},
+	{"embedder", "RAG_EMBEDDER"},
+	{"qdrant_url", "RAG_QDRANT_URL"},
+	{"qdrant_api_key", "RAG_QDRANT_API_KEY"},
+	{"chroma_url", "RAG_CHROMA_URL"},
+	{"pgvector_dsn", "RAG_PGVECTOR_DSN"},
+	{"sqlite_path", "RAG_SQLITE_PATH"},
+	{"tei_url", "RAG_TEI_URL"},
+	{"voyage_api_key", "RAG_VOYAGE_API_KEY"},
+	{"voyage_model", "RAG_VOYAGE_MODEL"},
+	{"voyage_dim", "RAG_VECTOR_DIM"},
+	{"openai_api_key", "RAG_OPENAI_API_KEY"},
+	{"openai_model", "RAG_OPENAI_MODEL"},
+	{"openai_base_url", "RAG_OPENAI_BASE_URL"},
+	{"openai_dim", "RAG_OPENAI_DIM"},
+	{"reranker_model", "RAG_RERANKER_MODEL"},
+	{"auto_sync_interval", "RAG_AUTO_SYNC_INTERVAL"},
+	{"admin_token", "RAG_ADMIN_TOKEN"},
+	{"remote_url", "RAG_REMOTE_URL"},
+	{"remote_token", "RAG_REMOTE_TOKEN"},
+	{"auto_import_sqlite", "RAG_AUTO_IMPORT_SQLITE"},
+}
+
+// EnvLocked lists the settings an environment variable sets: they override
+// config.yaml, so the dashboard shows them read-only.
+func EnvLocked() []string {
+	out := []string{}
+	for _, e := range envVars {
+		if os.Getenv(e.Env) != "" {
+			out = append(out, e.Key)
+		}
+	}
+	return out
+}
+
+// EnvVarFor is the environment variable that overrides setting key ("" if none).
+func EnvVarFor(key string) string {
+	for _, e := range envVars {
+		if e.Key == key {
+			return e.Env
+		}
+	}
+	return ""
 }
 
 // EffectiveAdminToken returns the admin token in effect: the RAG_ADMIN_TOKEN env
@@ -82,9 +160,10 @@ func Default() *Config {
 			Model: "voyage-4",
 			Dim:   1024,
 		},
-		QdrantURL: "http://localhost:6333",
-		ChromaURL: "http://localhost:8000",
-		TEIURL:    "http://localhost:8081",
+		QdrantURL:     "http://localhost:6333",
+		ChromaURL:     "http://localhost:8000",
+		TEIURL:        "http://localhost:8081",
+		RerankerModel: "rerank-3",
 	}
 }
 
@@ -97,6 +176,9 @@ func Path() string {
 	}
 	return filepath.Join(home, ".enowx-rag", "config.yaml")
 }
+
+// Dir is enowx-rag's data folder (~/.enowx-rag): config, stores, uploads.
+func Dir() string { return filepath.Dir(Path()) }
 
 // StorePath is the built-in store's file: cfg's, else ~/.enowx-rag/rag.db.
 func (cfg *Config) StorePath() string {
@@ -144,6 +226,25 @@ func Load() (*Config, error) {
 	// Apply env var overrides on top of file values.
 	applyEnvOverrides(&cfg)
 
+	return &cfg, nil
+}
+
+// LoadFile reads the config file as written, WITHOUT environment overrides:
+// the base for read-modify-write updates, so values an environment variable
+// supplies are never copied into the file. A missing file yields an empty
+// Config and no error.
+func LoadFile() (*Config, error) {
+	data, err := os.ReadFile(Path())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Config{}, nil
+		}
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config yaml: %w", err)
+	}
 	return &cfg, nil
 }
 
@@ -245,6 +346,15 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("RAG_AUTO_SYNC_INTERVAL"); v != "" {
 		cfg.AutoSyncInterval = v
+	}
+	if v := os.Getenv("RAG_REMOTE_URL"); v != "" {
+		cfg.RemoteURL = v
+	}
+	if v := os.Getenv("RAG_REMOTE_TOKEN"); v != "" {
+		cfg.RemoteToken = v
+	}
+	if v := os.Getenv("RAG_AUTO_IMPORT_SQLITE"); v != "" {
+		cfg.AutoImportSQLite = v
 	}
 	if v := os.Getenv("RAG_VECTOR_DIM"); v != "" {
 		if d, err := strconv.Atoi(v); err == nil && d > 0 {

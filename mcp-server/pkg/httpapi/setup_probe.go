@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -95,64 +94,4 @@ This project uses the enowx-rag MCP server for per-project RAG memory.
 - **After coding**: call `+"`rag_index`"+` with new facts/decisions/gotchas (code changes are synced automatically; the reasons behind them are not). Keep chunks focused; tag with `+"`type:architecture|decision|api|bugfix|howto|snippet`"+`.
 - Each project has its own collection; do not mix project memories.
 %s`, agentsMarkerStart, projectID, projectID, agentsMarkerEnd)
-}
-
-// SetupWriteAgentsMD handles POST /api/setup/write-agents-md.
-// Body: {dir, project_id}. It merges the enowx-rag block into the project's
-// AGENTS.md idempotently: if the file has the markers, the block is replaced;
-// if the file exists without markers, the block is appended; if the file does
-// not exist, it is created with the block. The user's own content is preserved.
-func (h *Handlers) SetupWriteAgentsMD(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Dir       string `json:"dir"`
-		ProjectID string `json:"project_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	if req.Dir == "" || req.ProjectID == "" {
-		writeErr(w, http.StatusBadRequest, "dir and project_id are required")
-		return
-	}
-	path := filepath.Join(expandHome(req.Dir), "AGENTS.md")
-	block := agentsBlock(req.ProjectID)
-
-	existing, err := os.ReadFile(path)
-	var out string
-	action := ""
-	switch {
-	case err != nil && os.IsNotExist(err):
-		out = "# Agent instructions\n\n" + block + "\n"
-		action = "created"
-	case err != nil:
-		writeErr(w, http.StatusInternalServerError, "read AGENTS.md: "+err.Error())
-		return
-	default:
-		content := string(existing)
-		if i := strings.Index(content, agentsMarkerStart); i >= 0 {
-			// Replace the existing block (idempotent update).
-			j := strings.Index(content, agentsMarkerEnd)
-			if j < 0 || j < i {
-				writeErr(w, http.StatusConflict, "AGENTS.md has a start marker without a matching end marker; fix it manually")
-				return
-			}
-			out = content[:i] + block + content[j+len(agentsMarkerEnd):]
-			action = "updated"
-		} else {
-			// Append the block, preserving the user's content.
-			sep := "\n\n"
-			if strings.HasSuffix(content, "\n") {
-				sep = "\n"
-			}
-			out = content + sep + block + "\n"
-			action = "appended"
-		}
-	}
-
-	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
-		writeErr(w, http.StatusInternalServerError, "write AGENTS.md: "+err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": action, "path": path})
 }

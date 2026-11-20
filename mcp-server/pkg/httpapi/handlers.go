@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/core"
 	"github.com/enowdev/enowx-rag/mcp-server/pkg/rag"
@@ -12,7 +13,10 @@ import (
 
 // Handlers holds the service layer reference shared by all HTTP handlers.
 type Handlers struct {
-	svc *core.Service
+	svc     *core.Service
+	opts    Options
+	jobs    *Jobs
+	uploads *uploadStore
 }
 
 // writeJSON writes a JSON response with the given status code.
@@ -32,18 +36,18 @@ func (h *Handlers) NotFound(w http.ResponseWriter, r *http.Request) {
 	writeErr(w, http.StatusNotFound, "API endpoint not found")
 }
 
-// ListProjects handles GET /api/projects.
-// Returns a JSON array of projects with chunk counts. Empty state returns [].
+// ListProjects handles GET /api/projects: projects with chunk and file
+// counts, where their code lives (sources) and how often they are searched.
 func (h *Handlers) ListProjects(w http.ResponseWriter, r *http.Request) {
-	stats, err := h.svc.ListProjects(r.Context())
+	details, err := h.svc.ProjectDetails(r.Context())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if stats == nil {
-		stats = []core.ProjectStat{}
+	if details == nil {
+		details = []core.ProjectDetail{}
 	}
-	writeJSON(w, http.StatusOK, stats)
+	writeJSON(w, http.StatusOK, details)
 }
 
 // GetProject handles GET /api/projects/{id}.
@@ -97,6 +101,13 @@ func (h *Handlers) ListPoints(w http.ResponseWriter, r *http.Request) {
 	metaFilter := map[string]string{}
 	if sf := r.URL.Query().Get("source_file"); sf != "" {
 		metaFilter["source_file"] = sf
+	}
+	// meta.<key>=<value> filters on any metadata key (client-mode sync lists a
+	// directory's points with meta.source_dir).
+	for k, v := range r.URL.Query() {
+		if key, ok := strings.CutPrefix(k, "meta."); ok && key != "" && len(v) > 0 {
+			metaFilter[key] = v[0]
+		}
 	}
 
 	points, err := h.svc.ListPoints(r.Context(), projectID, metaFilter)
@@ -155,42 +166,6 @@ func (h *Handlers) DeletePoint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "project_id": projectID, "point_id": pointID})
 }
 
-// ReindexProject handles POST /api/projects/{id}/reindex.
-// Triggers re-index and returns sync statistics.
-// Expects a JSON body with "directory" field.
-func (h *Handlers) ReindexProject(w http.ResponseWriter, r *http.Request) {
-	projectID := chi.URLParam(r, "id")
-	if projectID == "" {
-		writeErr(w, http.StatusBadRequest, "project id is required")
-		return
-	}
-
-	var req struct {
-		Directory string `json:"directory"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	if req.Directory == "" {
-		writeErr(w, http.StatusBadRequest, "directory is required")
-		return
-	}
-
-	result, err := h.svc.IndexProject(r.Context(), projectID, req.Directory)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":            "synced",
-		"project_id":        projectID,
-		"chunks_indexed":    result.Indexed,
-		"points_deleted":    result.Deleted,
-		"files_scanned":     result.FilesScanned,
-		"skipped":           result.Skipped,
-		"points_reembedded": result.Reembedded,
-		"stale_error":       result.StaleError,
-	})
-}
-
 // DeleteProject handles DELETE /api/projects/{id}.
 // Deletes the project collection.
 func (h *Handlers) DeleteProject(w http.ResponseWriter, r *http.Request) {
@@ -240,7 +215,7 @@ func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := h.svc.Search(r.Context(), req.ProjectID, req.Query, core.SearchOpts{
+	results, err := h.svc.Search(core.WithClient(r.Context(), requestClient(r)), req.ProjectID, req.Query, core.SearchOpts{
 		K:        req.K,
 		Recall:   req.Recall,
 		Hybrid:   req.Hybrid,
@@ -284,10 +259,11 @@ func (h *Handlers) Stats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Metrics handles GET /api/metrics.
-// Returns in-memory query metrics (latency aggregates, query count), token
-// usage read from the provider/reranker when available, and capability flags
-// (backend name, whether metrics are persisted).
+// Metrics handles GET /api/metrics: latency aggregates and token usage, plus
+// the durable 24h timeline, per-project usage and recent queries.
 func (h *Handlers) Metrics(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, h.svc.MetricsSnapshot(r.Context()))
+	writeJSON(w, http.StatusOK, struct {
+		core.MetricsSnapshot
+		core.Insights
+	}{h.svc.MetricsSnapshot(r.Context()), h.svc.Insights(r.Context())})
 }
