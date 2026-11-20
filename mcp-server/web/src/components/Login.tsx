@@ -61,7 +61,6 @@ export function Login({ theme, onToggleTheme, onSuccess, reason }: LoginProps) {
       >
         <Brand />
         <h1>Sign in to this server</h1>
-        <p className="login-sub">This dashboard is protected by an admin token.</p>
         {reason && <div className="login-reason">{reason}</div>}
         <div className="field">
           <label htmlFor="admin-token">Admin token</label>
@@ -72,15 +71,6 @@ export function Login({ theme, onToggleTheme, onSuccess, reason }: LoginProps) {
           {busy ? <Loader2 size={14} className="spin" /> : <LogIn size={14} />}
           Sign in
         </button>
-        <div className="login-hint">
-          <b>Where is my token?</b>
-          <ul>
-            <li>Printed by the installer at the end of the server setup.</li>
-            <li>The value of <span className="mono">RAG_ADMIN_TOKEN</span> in the server's environment (e.g. its docker-compose or systemd unit).</li>
-            <li>Generated earlier under Settings → Admin token, stored in the server's <span className="mono">config.yaml</span>.</li>
-          </ul>
-          The token is kept in this browser only (localStorage).
-        </div>
       </form>
     </div>
   )
